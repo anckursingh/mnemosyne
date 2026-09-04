@@ -27,15 +27,31 @@ jobs:
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo check --workspace
       # Per-push CI is the fast regression net — every unit test plus the
-      # fast integration tests. The minute-scale measurement suites (m7
-      # workload matrix, kse120c writer contention, relationship locality,
-      # wave31 scale, v2 merged-scan) are skipped here and smoke-tested
-      # weekly in benchmark-nightly.yml; they also run locally at
-      # milestones. The step exceeded 15 min even before Wave 5 (13m41s)
-      # and SE2-M8..M14 grew it past 30 (timed out mid-suite); the budget
-      # is 60 to cover the 2-core debug runner's remaining variance. If it
-      # exceeds again, move the next-slowest test here, don't raise it.
-      - run: cargo test --workspace -- --skip load_encryption_overhead --skip w31_scale_001_knowledge_complexity_scaling --skip w31_scale_002_id_family_flood --skip kse120c_report --skip kse120c_writer_contention --skip kse050_052_relationship_locality --skip m7_workloads --skip merged_iterator_correctness
+      # fast integration tests. Skip classification (PR#2 review SE-06):
+      # every test capable of finding data loss, wrong reads, wrong
+      # ordering, corruption or recovery failure runs a REDUCED
+      # DETERMINISTIC PR version here; only pure measurement stays
+      # scheduled (weekly release smoke in benchmark-nightly.yml + the
+      # nightly env at local milestones).
+      #
+      # | Test                             | Correctness | Performance | Resource | Certification (full version)       |
+      # |----------------------------------|:-----------:|:-----------:|:--------:|------------------------------------|
+      # | kse120c_writer_contention        | recovered == acked, byte-exact | latency cells | — | KSE120C_NIGHTLY=1 (20k) |
+      # | m7_workloads                     | gate verdict pins (workload asserts) | cells | RSS/disk cells | M7_NIGHTLY=1 (100k) |
+      # | kse050_052_relationship_locality | result-size pins + KSE-052 bidirectional | cells | — | KSE6_NIGHTLY=1 (10k hub) |
+      # | merged_iterator_correctness      | byte-exact vs oracle | — | — | SE2M12_NIGHTLY=1 (50k steps) |
+      # | w31_scale_001                    | probe success 12/12 per scale | cells | 10K synthesis | W31_SCALE_NIGHTLY=1 (100k) |
+      # | w31_scale_002                    | probe pins (n=1000 fixed) | cells | — | runs fully on PR |
+      # | kse120c_report (SKIPPED)         | covered by the contention test — same scenarios | report generator | — | weekly release smoke |
+      # | load_encryption_overhead (SKIPPED) | — | pure measurement | — | weekly --ignored release (also #[ignore] in debug) |
+      #
+      # Measured PR-default debug times (dev box): contention 4s, kse6 5s,
+      # merged-scan 6s, wave31 30s, m7 144s. The step exceeded 15 min even
+      # before Wave 5 (13m41s) and SE2-M8..M14 grew it past 30 (timed out
+      # mid-suite); the budget is 60 to cover the 2-core debug runner's
+      # remaining variance. If it exceeds again, move the next-slowest
+      # test here, don't raise it.
+      - run: cargo test --workspace -- --skip load_encryption_overhead --skip kse120c_report
         timeout-minutes: 60
       # DoD 19 (HLD §52/§53): golden PDF suite with visible per-stage
       # metrics — extraction/fragmentation/semantic/provenance/retrieval.
@@ -56,11 +72,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace -- --skip load_encryption_overhead --skip w31_scale_001_knowledge_complexity_scaling --skip w31_scale_002_id_family_flood --skip kse120c_report --skip kse120c_writer_contention --skip kse050_052_relationship_locality --skip m7_workloads --skip merged_iterator_correctness
-        # Fast regression net — the skipped minute-scale measurement suites
-        # run in benchmark-nightly.yml and locally at milestones. The full
-        # suite used to run 14-16 min on the 2-core runner; the skips keep
-        # it there instead of the ~25 min SE2-M8..M14 added.
+      - run: cargo test --workspace -- --skip load_encryption_overhead --skip kse120c_report
+        # Fast regression net. Only pure measurement is skipped (SE-06
+        # classification — see the check job's table); every
+        # correctness-capable suite runs its reduced deterministic PR
+        # version here. The full suite used to run 14-16 min on the
+        # 2-core runner; the correctness suites add ~3-5 min back in
+        # debug — the budget stays 30.
         timeout-minutes: 30
 
   lint:

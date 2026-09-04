@@ -28,9 +28,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-const FAN_OUTS: [usize; 5] = [1, 10, 100, 1_000, 10_000];
 const REPS: usize = 10;
 const SALT: u64 = 0xC0FFEE;
+const NIGHTLY_ENV: &str = "KSE6_NIGHTLY";
+
+/// PR#2 review SE-06: the PR gate runs a reduced deterministic fan-out
+/// set (no 10 000-edge hub); `KSE6_NIGHTLY=1` restores the full matrix
+/// for the canonical §12 report. Strict opt-in — any other value fails.
+fn fan_outs() -> &'static [usize] {
+    match std::env::var(NIGHTLY_ENV) {
+        Err(std::env::VarError::NotPresent) => &[1, 10, 100, 1_000],
+        Ok(v) if v == "1" => &[1, 10, 100, 1_000, 10_000],
+        other => panic!("{NIGHTLY_ENV} strict opt-in: unset or 1, got {other:?}"),
+    }
+}
 
 fn alice() -> Subject {
     Subject::new("alice")
@@ -60,7 +71,7 @@ type Edge = (aikoql_kernel::KOID, String, aikoql_kernel::KOID); // (hub, type, l
 /// outbound neighbors (interleaved "links"/"cites"). Returns the hubs and
 /// every (hub, type, leaf) edge for the KSE-052 consistency pin.
 fn seed(k: &Kernel) -> (Vec<Hub>, Vec<Edge>) {
-    let total_leaves: usize = FAN_OUTS.iter().sum();
+    let total_leaves: usize = fan_outs().iter().sum();
     let mut leaves = Vec::with_capacity(total_leaves);
     for _ in 0..total_leaves {
         leaves.push(
@@ -72,7 +83,7 @@ fn seed(k: &Kernel) -> (Vec<Hub>, Vec<Edge>) {
     let mut hubs = Vec::new();
     let mut edges = Vec::new();
     let mut offset = 0;
-    for f in FAN_OUTS {
+    for &f in fan_outs() {
         let mut req = RememberRequest::create(alice(), meta());
         for i in 0..f {
             req.relationships.push(RelationshipRef {
@@ -149,7 +160,7 @@ fn measure(name: &'static str, engine: Arc<dyn StorageEngine>) -> BackendReport 
 
     // KSE-052: bidirectional consistency — every outbound edge must appear
     // as an inbound edge on the leaf, same type, pointing back at the hub.
-    assert_eq!(edges.len(), FAN_OUTS.iter().sum::<usize>());
+    assert_eq!(edges.len(), fan_outs().iter().sum::<usize>());
     for (hub, t, leaf) in &edges {
         let ins = k.inbound_edges(leaf, Some(t)).unwrap();
         assert!(
@@ -166,17 +177,26 @@ fn report_md(
     rocksdb: &Option<BackendReport>,
     aikoql: &BackendReport,
 ) -> String {
+    let fans = fan_outs();
     let mut s = String::new();
     s.push_str(&format!(
         "# KSE-050..052 — Relationship Locality (MRFC-KSE-001 §12)\n\n\
          Measured {} on {} (debug build — indicative, not release numbers).\n\
-         Dataset per backend: 5 hubs with 1/10/100/1,000/10,000 outbound \
-         neighbors (interleaved \"links\"/\"cites\"), 11,111 leaf KOs, one \
+         Dataset per backend: {} hubs with {}/{} outbound \
+         neighbors (interleaved \"links\"/\"cites\"), {} leaf KOs, one \
          database per backend, {REPS} timed reps per lookup.\n\
          Allocations: NOT_MEASURED (no counting-allocator instrumentation \
          wired).\n\n",
         chrono_now(),
         std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into()),
+        fans.len(),
+        fans[..fans.len() - 1]
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join("/"),
+        fans[fans.len() - 1],
+        fans.iter().sum::<usize>(),
     ));
     s.push_str("| fan-out | op | redb P50/P95/P99 (µs) | redb engine reqs | RocksDB P50/P95/P99 (µs) | Aikoql P50/P95/P99 (µs) | Aikoql engine reqs |\n|---|---|---|---|---|---|---|\n");
     for row in &redb.rows {
@@ -207,9 +227,9 @@ fn report_md(
             ak.counts,
         ));
     }
-    s.push_str(
+    s.push_str(&format!(
         "\n## Consistency (KSE-052)\n\n\
-         All 11,111 edges verified bidirectionally on every measured \
+         All {} edges verified bidirectionally on every measured \
          backend: for each outbound (hub -type-> leaf), \
          inbound_edges(leaf, type) contains the hub. Zero divergences — the \
          relo/reli index pair is symmetric over AikoqlStorageEngine exactly \
@@ -223,7 +243,8 @@ fn report_md(
          write path off the kernel's own index rows. No prototype built; \
          revisit only if a release-build profile shows the per-row key copy \
          dominating.\n",
-    );
+        fans.iter().sum::<usize>(),
+    ));
     s
 }
 

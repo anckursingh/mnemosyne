@@ -1,8 +1,9 @@
 //! SE2-M12 — the k-way merged scan iterator (QA M4 + M5): correctness vs a
-//! reference oracle over 50 000 randomized states, prefix-isolation
-//! evidence (unrelated rows decoded ≈ 0), and the W4/W5 scan-amplification
-//! report (`SE2M12_NIGHTLY=1` strict opt-in). The V2-Adopt `db_scan` suite
-//! remains the byte-exact scan regression.
+//! reference oracle over up to 50 000 randomized states (5 000 by default —
+//! PR#2 review SE-06 — `SE2M12_NIGHTLY=1` restores the full certification
+//! shape), prefix-isolation evidence (unrelated rows decoded ≈ 0), and the
+//! W4/W5 scan-amplification report (`SE2M12_NIGHTLY=1` strict opt-in). The
+//! V2-Adopt `db_scan` suite remains the byte-exact scan regression.
 
 mod common;
 
@@ -61,14 +62,26 @@ fn rel_out_key(src: &[u8; 16], rel: &str, dst: &[u8; 16]) -> Vec<u8> {
     k
 }
 
-/// 50 000 randomized steps — puts, deletes, deterministic flushes and
-/// compactions over a versioned key space, every scan byte-exact vs the
-/// oracle (QA TC-PERF-0501). The merged iterator is the regression
+/// PR#2 review SE-06: PR CI needs a reduced deterministic version —
+/// unset runs 5 000 steps, `SE2M12_NIGHTLY=1` (the shared nightly knob)
+/// runs the full 50 000-step QA TC-PERF-0501 certification shape.
+/// Strict opt-in: any other value fails.
+fn steps() -> usize {
+    match std::env::var(NIGHTLY) {
+        Err(std::env::VarError::NotPresent) => 5_000,
+        Ok(v) if v == "1" => 50_000,
+        other => panic!("{NIGHTLY} must be unset or \"1\", got {other:?} (strict opt-in)"),
+    }
+}
+
+/// Up to 50 000 randomized steps — puts, deletes, deterministic flushes
+/// and compactions over a versioned key space, every scan byte-exact vs
+/// the oracle (QA TC-PERF-0501). The merged iterator is the regression
 /// surface: newest-layer-wins heads, tombstone suppression, prefix
 /// bounds, ascending order, across churning L0/L1 layer stacks.
 #[test]
 fn merged_iterator_correctness() {
-    const STEPS: usize = 50_000;
+    let steps = steps();
     const KEYS: usize = 40;
     const FLUSH_EVERY: usize = 200;
     const COMPACT_EVERY: usize = 800;
@@ -80,7 +93,7 @@ fn merged_iterator_correctness() {
     let mut rng = Rng(0x51ed_2701_4adf_05e5);
     let prefixes: [&[u8]; 3] = [b"key-0", b"key-1", b"key-2"];
 
-    for step in 0..STEPS {
+    for step in 0..steps {
         let r = rng.next();
         let key = format!("key-{:02}-{:02}", r as usize % KEYS, (r >> 8) as usize % 7).into_bytes();
         let value = format!("v-{step}").into_bytes();
