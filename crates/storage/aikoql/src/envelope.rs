@@ -11,10 +11,18 @@
 //! than one full record — crash mid-append) is distinguished from corruption:
 //! replay truncates the former, fails closed on the latter. KSE-11 reserves
 //! flags bit 0 for encrypted payloads.
+//!
+//! Threat model (PR#2 review SE-07): the 8-byte checksum is an INTEGRITY
+//! FINGERPRINT — accidental corruption detection YES (false-positive
+//! ~2^-64 per candidate), cryptographic authenticity NO (no keyed input),
+//! attacker modification resistance NO (an attacker who can rewrite bytes
+//! can recompute the fingerprint). Adversarial integrity belongs to the
+//! encrypted envelope (MRFC-0020, KSE-11), whose keyed cipher authenticates
+//! payloads; this checksum only catches bit rot, truncation and torn tails.
 
 use aikoql_kernel::knowledge::kom::{sha256, KError, KResult};
 
-const MAGIC: &[u8; 4] = b"AKQL";
+pub const MAGIC: &[u8; 4] = b"AKQL";
 pub const FORMAT_VERSION: u8 = 1;
 pub const TYPE_BATCH: u8 = 1;
 const HEADER_LEN: usize = 11;

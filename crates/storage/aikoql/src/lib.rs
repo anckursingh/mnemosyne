@@ -140,15 +140,23 @@ fn decode_batch(payload: &[u8]) -> KResult<WriteBatch> {
 /// direction: a false positive needs a whole valid record to hide inside
 /// the tail (~2^-64 per candidate checksum), and it would fail closed
 /// where recovery could have proceeded — never the reverse.
-/// ponytail: O(remaining bytes) once per open, and only when a torn tail
-/// exists — clean opens and full replay never pay it.
+/// PR#2 review SE-10: only offsets whose 4-byte window is the WAL magic can
+/// start a record (parse_at rejects anything else), so the full parse runs
+/// only on magic matches. ponytail: the window scan is still O(remaining
+/// bytes), once per open, and only when a torn tail exists — clean opens
+/// and full replay never pay it. Streaming replay with a bounded buffer
+/// belongs to checkpointing (SE-03 re-adoption conditions).
 fn valid_record_after(bytes: &[u8], pos: usize) -> bool {
-    (pos + 1..bytes.len()).any(|off| {
-        matches!(
-            envelope::parse_at(bytes, off),
-            Ok(envelope::ParseOutcome::Complete { .. })
-        )
-    })
+    bytes[pos + 1..]
+        .windows(envelope::MAGIC.len())
+        .enumerate()
+        .filter(|(_, w)| *w == envelope::MAGIC)
+        .any(|(i, _)| {
+            matches!(
+                envelope::parse_at(bytes, pos + 1 + i),
+                Ok(envelope::ParseOutcome::Complete { .. })
+            )
+        })
 }
 
 /// Replay `bytes` into a fresh map; returns the offset of the last complete

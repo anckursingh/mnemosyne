@@ -67,7 +67,12 @@ impl fmt::Display for FormatError {
 
 impl std::error::Error for FormatError {}
 
-/// v1 convention: the first 8 bytes of the sha256 carry the integrity check.
+/// v1 convention: the first 8 bytes of the sha256 carry the integrity
+/// check — an INTEGRITY FINGERPRINT (PR#2 review SE-07 threat model):
+/// accidental corruption detection YES (false-positive ~2^-64), cryptographic
+/// authenticity NO, attacker modification resistance NO. Anything adversarial
+/// belongs to the encrypted envelope (MRFC-0020); this checksum only catches
+/// bit rot, truncation and torn tails.
 pub fn checksum8(bytes: &[u8]) -> [u8; 8] {
     let full = sha256(bytes);
     full[..8].try_into().expect("sha256-8 slice")
