@@ -509,6 +509,11 @@ impl Db {
                 .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             Arc::clone(&state.segments)
         };
+        // SE2-M22 — one key hash per get, shared by every segment's bloom
+        // probe (the per-segment re-hash was ~5-7 sha256s per get). Computed
+        // inside the first segment's probe timer so the bloom row keeps
+        // meaning "all bloom work for this get" (the M21 accounting pins).
+        let mut bloom_hash: Option<(u64, u64)> = None;
         for seg in segments.iter().rev() {
             self.stats
                 .segments_considered
@@ -525,8 +530,10 @@ impl Db {
             // SE2-M7 — bloom pre-check: false positives possible, false
             // negatives never (M1 pin), so skipping a segment the bloom
             // rejects is answer-preserving; it just saves the probe.
+            // SE2-M22 — one key hash per get, shared across segments.
             let t_bloom = Instant::now();
-            let may = seg.bloom_may_contain(key);
+            let (h1, h2) = *bloom_hash.get_or_insert_with(|| SegmentReader::bloom_hashes(key));
+            let may = seg.bloom_may_contain_hashes(h1, h2);
             self.stats
                 .bloom_probe_ns
                 .fetch_add(t_bloom.elapsed().as_nanos() as u64, Ordering::Relaxed);

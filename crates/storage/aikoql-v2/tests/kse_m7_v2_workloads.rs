@@ -1429,7 +1429,7 @@ fn v2_attribution_probe() {
          - Date: {}\n\
          - Dataset: one v2 database, {} KOs / {} deep × {DEEP_VERSIONS} versions / {} ops per leg, seeded through the Kernel over the adapter (SEED {SEED:#x}); the mechanism legs run on a second small Db with the same row shape\n\
          - Reference: M19 warm W1/W2 P50 ≈ 37 µs ≈ 27 µs engine + 10 µs kernel; M17 hot-path 3.5 µs; M18 hot context 92.8 µs\n\n\
-         Each row = P50/P95/P99 over {} ops; engine phases are per-op ReadPathStats deltas (SE2-M8 counters + the M21 lock_wait/bloom/get_wall closure), kernel overhead = external wall − engine get_wall.\n\n",
+         Each row = P50/P95/P99 over {} ops; engine phases are per-op ReadPathStats deltas (SE2-M8 counters + the M21 lock_wait/bloom/get_wall closure), kernel overhead = external wall − engine get_wall. SE2-M22: the bloom row still covers all bloom work for a get — the key hash is computed once per get inside the first segment's probe timer (was once per segment).\n\n",
         if cfg!(debug_assertions) { "debug" } else { "release" },
         run_date(),
         sz.n,

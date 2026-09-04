@@ -825,12 +825,27 @@ impl SegmentReader {
         self.seq_hi
     }
 
+    /// The key's bloom hash pair (the sha256 split) — one hash per get,
+    /// shared by every segment's probe (SE2-M22: the probe used to re-hash
+    /// the key per segment, ~5-7 sha256s per get).
+    pub fn bloom_hashes(key: &[u8]) -> (u64, u64) {
+        let d = sha256(key);
+        (
+            u64::from_le_bytes(d[..8].try_into().expect("sha256 len")),
+            u64::from_le_bytes(d[8..16].try_into().expect("sha256 len")),
+        )
+    }
+
     /// False positives possible, false negatives never: a false answer means
     /// the key is definitely not in the segment.
     pub fn bloom_may_contain(&self, key: &[u8]) -> bool {
-        let d = sha256(key);
-        let h1 = u64::from_le_bytes(d[..8].try_into().expect("sha256 len"));
-        let h2 = u64::from_le_bytes(d[8..16].try_into().expect("sha256 len"));
+        let (h1, h2) = Self::bloom_hashes(key);
+        self.bloom_may_contain_hashes(h1, h2)
+    }
+
+    /// The probe over an already-computed hash pair (SE2-M22 — the Db hashes
+    /// once per get and shares the pair across segments).
+    pub fn bloom_may_contain_hashes(&self, h1: u64, h2: u64) -> bool {
         let bits = &self.bloom[4..];
         for i in 0..BLOOM_PROBES {
             let bit = ((h1 as u128 + i as u128 * h2 as u128) % self.bloom_m as u128) as usize;
@@ -939,10 +954,14 @@ impl SegmentReader {
         // SE2-M21: the first-touch checksum validation is block-I/O-path
         // work — inside the io timer, so a cold get attributes fully.
         if !b.validated.load(Ordering::Relaxed) {
-            let mut sk = Vec::with_capacity(20 + b.payload_len);
-            sk.extend_from_slice(&raw[..20]);
-            sk.extend_from_slice(&raw[BLOCK_HEADER_LEN..]);
-            if checksum8(&sk) != raw[20..BLOCK_HEADER_LEN] {
+            // SE2-M22 — chained updates over the two slices instead of
+            // copying them into one buffer first (that copy was a second
+            // full-block memcpy per first touch). Byte-identical digest.
+            let mut hasher = Sha256::new();
+            hasher.update(&raw[..20]);
+            hasher.update(&raw[BLOCK_HEADER_LEN..]);
+            let digest = hasher.finalize();
+            if digest[..8] != raw[20..BLOCK_HEADER_LEN] {
                 return Err(FormatError::Corrupt(format!(
                     "data block {i} checksum mismatch"
                 )));
