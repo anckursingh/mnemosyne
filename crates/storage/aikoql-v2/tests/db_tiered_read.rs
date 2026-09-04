@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 /// One flush per round: 8 puts x ~64 B (memtable accounting) crosses a
 /// 512-byte memtable from empty — the M16 fixture geometry.
-fn round_put(db: &mut Db, r: usize) {
+fn round_put(db: &Db, r: usize) {
     for i in 0..8 {
         let k = format!("k{r:03}{i:02}").into_bytes();
         let v = format!("v{r:03}{i:02}{}", "y".repeat(34)).into_bytes();
@@ -28,7 +28,7 @@ fn round_put(db: &mut Db, r: usize) {
 /// [key_min, key_max] spans the whole k00...-k07... band — a target inside
 /// the band is in-range of EVERY segment (the adversarial fan-out shape,
 /// where the range skip cannot prune).
-fn band_put(db: &mut Db, r: usize) {
+fn band_put(db: &Db, r: usize) {
     for i in 0..8 {
         let k = format!("k{i:02}{r:03}").into_bytes();
         let v = format!("v{i:02}{r:03}{}", "y".repeat(34)).into_bytes();
@@ -45,10 +45,10 @@ fn l0_count(d: &std::path::Path) -> usize {
 /// Drive rounds until the tiered pile holds at least `depth` L0 segments
 /// (the M16 skip state), then return the round reached.
 fn drive_to_depth(
-    db: &mut Db,
+    db: &Db,
     d: &std::path::Path,
     depth: usize,
-    mut put: impl FnMut(&mut Db, usize),
+    mut put: impl FnMut(&Db, usize),
 ) -> usize {
     let mut r = 0;
     loop {
@@ -75,9 +75,9 @@ fn tier_depth_answers_match_oracle() {
     let d = dir("tiered-read-oracle");
     let mut cfg = Config::new(d.clone());
     cfg.memtable_bytes = 512;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-    let rounds = drive_to_depth(&mut db, &d, 10, |db, r| {
+    let rounds = drive_to_depth(&db, &d, 10, |db, r| {
         round_put(db, r);
         for i in 0..8 {
             let k = format!("k{r:03}{i:02}").into_bytes();
@@ -129,9 +129,9 @@ fn tier_depth_answers_match_oracle() {
     let mut cfg = Config::new(d2.clone());
     cfg.memtable_bytes = 512;
     cfg.l0_tier_ratio = 0;
-    let mut twin = Db::open(cfg).unwrap();
+    let twin = Db::open(cfg).unwrap();
     for r in 1..=rounds {
-        round_put(&mut twin, r);
+        round_put(&twin, r);
     }
     for (k, v) in &expect {
         assert_eq!(
@@ -156,8 +156,8 @@ fn tier_depth_fanout_absorbed() {
     let d = dir("tiered-read-fanout");
     let mut cfg = Config::new(d.clone());
     cfg.memtable_bytes = 512;
-    let mut db = Db::open(cfg).unwrap();
-    let rounds = drive_to_depth(&mut db, &d, 10, band_put);
+    let db = Db::open(cfg).unwrap();
+    let rounds = drive_to_depth(&db, &d, 10, band_put);
     let target = b"k005999".to_vec(); // inside every segment's band, written by nobody
     let s0 = db.read_path_stats();
     assert_eq!(db.get(&target).unwrap(), None, "band target must miss");

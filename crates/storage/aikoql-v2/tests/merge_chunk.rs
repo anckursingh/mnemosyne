@@ -43,7 +43,7 @@ fn segment_files(d: &Path) -> Vec<PathBuf> {
 
 /// 100 keys × 100-byte values — ~12 KiB of rows, ~24 chunks at a
 /// 512-byte cap (~122 bytes estimated per entry).
-fn seed(db: &mut Db, n: usize) {
+fn seed(db: &Db, n: usize) {
     let value = vec![b'v'; 100];
     for i in 0..n {
         db.put(format!("k{i:04}").as_bytes(), &value).unwrap();
@@ -54,8 +54,8 @@ fn seed(db: &mut Db, n: usize) {
 #[test]
 fn merge_chunks_respect_chunk_cap() {
     let d = dir("merge-chunk-geometry");
-    let mut db = Db::open(chunked_cfg(d.clone(), 512)).unwrap();
-    seed(&mut db, 100);
+    let db = Db::open(chunked_cfg(d.clone(), 512)).unwrap();
+    seed(&db, 100);
     let l0 = segment_files(&d).len(); // flushes before the compact
     assert!(l0 >= 2, "the 4 KiB memtable must flush before the compact");
     let stats = db.compact().unwrap();
@@ -117,7 +117,7 @@ fn merge_chunks_answers_parity_with_unbounded() {
     // One deterministic workload (overwrites, deletes, versions) merged
     // unbounded and chunked: the logical state must be byte-identical.
     let run = |d: PathBuf, chunk: usize| -> (Vec<ScanRow>, u64) {
-        let mut db = Db::open(chunked_cfg(d.clone(), chunk)).unwrap();
+        let db = Db::open(chunked_cfg(d.clone(), chunk)).unwrap();
         let mut s = 7u64;
         let mut next = || {
             s ^= s << 13;
@@ -162,7 +162,7 @@ impl RetentionPolicy for ArchiveA {
 #[test]
 fn merge_chunks_archive_splits_across_chunks() {
     let d = dir("merge-chunk-archive");
-    let mut db = Db::open(chunked_cfg(d.clone(), 512)).unwrap();
+    let db = Db::open(chunked_cfg(d.clone(), 512)).unwrap();
     for i in 0..200 {
         db.put(format!("ko/a/{i:04}").as_bytes(), &[b'v'; 64])
             .unwrap();
@@ -262,7 +262,7 @@ fn expected() -> HashMap<Vec<u8>, Option<Vec<u8>>> {
     m
 }
 
-fn run_workload_then_compact(db: &mut Db) {
+fn run_workload_then_compact(db: &Db) {
     for (put, k, v) in ops() {
         if put {
             db.put(&k, &v).unwrap();
@@ -287,8 +287,8 @@ fn child_branch() -> bool {
     );
     cfg.memtable_bytes = 512;
     cfg.l0_compact_trigger = 0;
-    let mut db = Db::open(cfg).unwrap();
-    run_workload_then_compact(&mut db);
+    let db = Db::open(cfg).unwrap();
+    run_workload_then_compact(&db);
     unreachable!("the parent kills the parked child");
 }
 
@@ -297,7 +297,7 @@ fn child_branch() -> bool {
 /// the orphan chunks (reopen's next_segment_id = old max + 1 = the first
 /// orphan's id — the M3 reuse-by-rename behavior) and survives reopen.
 fn verify(d: &Path) {
-    let mut db = Db::open(Config::new(d.to_path_buf())).unwrap();
+    let db = Db::open(Config::new(d.to_path_buf())).unwrap();
     for (k, want) in &expected() {
         assert_eq!(
             db.get(k).unwrap(),

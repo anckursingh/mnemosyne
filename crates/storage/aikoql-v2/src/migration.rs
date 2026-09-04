@@ -152,7 +152,7 @@ pub fn migrate_v1_wal(source: &Path, config: Config) -> Result<MigrationReport, 
     // Feed the batches through the normal write path (segments → manifest →
     // CURRENT by the standard flush machinery), then close and reopen.
     {
-        let mut db = Db::open(config.clone())?;
+        let db = Db::open(config.clone())?;
         for ops in &batches {
             db.write(ops)?;
         }

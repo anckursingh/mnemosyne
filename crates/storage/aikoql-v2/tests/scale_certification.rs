@@ -221,7 +221,7 @@ fn file_len(path: &Path) -> u64 {
 /// F=100 / F=1000 `fan` edges (the RMW restatement shape). Sync durability,
 /// default memtable/cache/compaction — the production defaults.
 fn build_dataset(dir: &Path, sz: Size) -> Built {
-    let mut db = Db::open(Config::new(dir.to_path_buf())).unwrap();
+    let db = Db::open(Config::new(dir.to_path_buf())).unwrap();
     let mut rng = Xs(SEED);
     let koids: Vec<[u8; 16]> = (0..sz.n).map(|_| koid_of(&mut rng)).collect();
     let t0 = Instant::now();
@@ -558,7 +558,7 @@ fn matrix(dir: &Path, b: &Built, sz: Size) -> Vec<Row> {
     drop(db);
 
     // ---- warm + hot: default cache (8 MiB), one open — per-row pins ----
-    let mut db = Db::open(Config::new(dir.to_path_buf())).unwrap();
+    let db = Db::open(Config::new(dir.to_path_buf())).unwrap();
     {
         let mut r = warm_pinned(
             &db,

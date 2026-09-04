@@ -68,7 +68,7 @@ fn ten_segments(tag: &str) -> (Db, String) {
     // compaction would clobber both mid-setup (compaction I/O is counted).
     cfg.l0_compact_trigger = 0;
     cfg.block_target = 256;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     // Target FIRST so it lives in the oldest segment: get walks newest-first,
     // so the nine filler segments are bloom-rejected before the hit.
     db.put(target.as_bytes(), &[b'v'; 200][..]).unwrap();
@@ -92,7 +92,7 @@ fn ten_disjoint_segments(tag: &str) -> (Db, String) {
     // SE2-M10: pins the exact 10-segment layout (see ten_segments).
     cfg.l0_compact_trigger = 0;
     cfg.block_target = 256;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     db.put(target.as_bytes(), &[b'v'; 200][..]).unwrap();
     db.flush().unwrap();
     for i in 0..9 {

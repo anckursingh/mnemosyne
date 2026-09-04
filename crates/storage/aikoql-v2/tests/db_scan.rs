@@ -24,7 +24,7 @@ fn expected(rows: &[(&str, &str)]) -> BTreeMap<Vec<u8>, Vec<u8>> {
 #[test]
 fn scan_merges_layers_newest_wins() {
     let d = dir("scan-layers");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
 
     // layer 1 (flushed): k1, k2, k3
     db.put(b"k1", b"v1").unwrap();
@@ -55,7 +55,7 @@ fn scan_merges_layers_newest_wins() {
 #[test]
 fn scan_prefix_bounds_and_sorted() {
     let d = dir("scan-prefix");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"a/1", b"1").unwrap();
     db.put(b"a/3", b"3").unwrap();
     db.put(b"a/2", b"2").unwrap();
@@ -98,7 +98,7 @@ fn scan_prefix_bounds_and_sorted() {
 #[test]
 fn scan_collapses_versions_to_head_across_segments() {
     let d = dir("scan-versions");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     for i in 0..5 {
         db.put(b"hot", format!("v{i}").as_bytes()).unwrap();
         db.flush().unwrap(); // five versions across five segments
@@ -117,7 +117,7 @@ fn scan_collapses_versions_to_head_across_segments() {
 #[test]
 fn scan_survives_compact() {
     let d = dir("scan-compact");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     for i in 0..20 {
         db.put(format!("k{i:02}").as_bytes(), format!("v{i}").as_bytes())
             .unwrap();

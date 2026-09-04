@@ -29,7 +29,7 @@ fn explicit_weaker_modes_write_and_read() {
         let d = dir(&format!("modes-{mode:?}"));
         let mut cfg = Config::new(d.clone());
         cfg.durability = mode; // explicit opt-in — never silent
-        let mut db = Db::open(cfg).unwrap();
+        let db = Db::open(cfg).unwrap();
         db.put(b"k1", b"v1").unwrap();
         db.put(b"k2", b"v2").unwrap();
         assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));

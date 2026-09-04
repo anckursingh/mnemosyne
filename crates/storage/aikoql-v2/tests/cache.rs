@@ -39,7 +39,7 @@ fn cache_is_bounded_and_evicts_under_load() {
     cfg.block_target = 1024; // many small blocks, ~8 entries each
     let db = Db::open(cfg).unwrap();
 
-    let mut db = db;
+    let db = db;
     const KEYS: u64 = 40;
     for i in 0..KEYS {
         db.put(&format!("key-{i:03}").into_bytes(), &[b'x'; 128])
@@ -88,7 +88,7 @@ fn cache_never_changes_answers() {
     let run = |cache_bytes: usize| -> Vec<Option<Vec<u8>>> {
         let mut cfg = cfg_with_cache(dir("cache-neutral"), cache_bytes);
         cfg.block_target = 2048;
-        let mut db = Db::open(cfg).unwrap();
+        let db = Db::open(cfg).unwrap();
         let mut rng = Rng(0x5eed);
         let mut answers = Vec::new();
         for step in 0..WORKLOAD {
@@ -196,7 +196,7 @@ fn warm_block_cache_speedup() {
     let d = dir("cache-perf-cold");
     let mut cfg = cfg_with_cache(d, 0);
     cfg.block_target = 64 * 1024;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for k in &keys {
         db.put(k, &[b'z'; 200]).unwrap();
     }
@@ -213,7 +213,7 @@ fn warm_block_cache_speedup() {
     let d = dir("cache-perf-warm");
     let mut cfg = cfg_with_cache(d, 64 * 1024 * 1024);
     cfg.block_target = 64 * 1024;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for k in &keys {
         db.put(k, &[b'z'; 200]).unwrap();
     }

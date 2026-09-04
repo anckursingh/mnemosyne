@@ -50,7 +50,7 @@ fn logical_state_survives_compaction() {
     let mut cfg = Config::new(d.clone());
     cfg.memtable_bytes = 512; // many flushes → several L0 segments
     cfg.l0_compact_trigger = 0; // SE2-M10: this test pins MANUAL compaction
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     let mut next = rng(7);
     let mut oracle: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
     for i in 0..400u64 {
@@ -114,7 +114,7 @@ fn logical_state_survives_compaction() {
 #[test]
 fn tombstone_at_bottom_drops_the_key() {
     let d = dir("compact-tomb");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"k", b"v1").unwrap();
     db.flush().unwrap();
     db.compact().unwrap(); // L1: k=v1
@@ -151,7 +151,7 @@ fn tombstone_at_bottom_drops_the_key() {
 #[test]
 fn cross_level_overwrites_collapse_to_newest() {
     let d = dir("compact-collapse");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"k", b"old").unwrap();
     db.flush().unwrap();
     db.compact().unwrap(); // L1: old
@@ -170,7 +170,7 @@ fn cross_level_overwrites_collapse_to_newest() {
 #[test]
 fn same_level_overwrites_collapse_to_newest() {
     let d = dir("compact-collapse-l0");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"k", b"v1").unwrap();
     db.flush().unwrap();
     db.put(b"k", b"v2").unwrap();
@@ -190,7 +190,7 @@ fn same_level_overwrites_collapse_to_newest() {
 #[test]
 fn compact_is_a_noop_without_segments() {
     let d = dir("compact-noop");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     let stats = db.compact().unwrap();
     assert_eq!(
         stats.segments_in + stats.segments_out + stats.entries_in + stats.entries_out,
@@ -211,7 +211,7 @@ fn readers_continue_and_obsolete_survive_while_referenced() {
     let mut cfg = Config::new(d.clone());
     cfg.memtable_bytes = 512;
     cfg.l0_compact_trigger = 0; // SE2-M10: segment 1 must survive to open
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     let mut next = rng(11);
     let mut oracle: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
     for i in 0..200u64 {

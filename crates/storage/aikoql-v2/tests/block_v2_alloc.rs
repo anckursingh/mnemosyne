@@ -38,7 +38,7 @@ fn block_v2_allocation_regression() {
     let mut cfg = Config::new(dir("blockv2-alloc"));
     cfg.memtable_bytes = usize::MAX;
     cfg.block_target = 1 << 20; // one block for the whole dataset
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     let keys: Vec<Vec<u8>> = (0..N).map(|i| format!("key-{i:06}").into_bytes()).collect();
     for k in &keys {
         db.put(k, &[b'v'; 16][..]).unwrap();

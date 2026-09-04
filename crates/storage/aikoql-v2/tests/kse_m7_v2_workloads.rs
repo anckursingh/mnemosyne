@@ -1099,7 +1099,7 @@ fn v2_attribution_probe() {
     let small = tmp("v2-attrib-small");
     let mut cfg = Config::new(small.clone());
     cfg.memtable_bytes = usize::MAX; // nothing flushes — every get a hit
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for i in 0..1000 {
         db.put(
             &format!("a/{i:04}").into_bytes(),

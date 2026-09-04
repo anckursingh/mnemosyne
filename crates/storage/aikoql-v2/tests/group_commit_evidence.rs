@@ -167,7 +167,7 @@ fn group_commit_effectiveness() {
     let d = dir("gc-eff-sync");
     let t0 = std::time::Instant::now();
     let sync_fsyncs = {
-        let mut db = Db::open(Config::new(d.clone())).unwrap();
+        let db = Db::open(Config::new(d.clone())).unwrap();
         for i in 0..BATCHES {
             db.write(&[Op::Put(format!("key-{i:04}").into_bytes(), val.clone())])
                 .unwrap();

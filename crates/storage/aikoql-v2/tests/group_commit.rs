@@ -247,7 +247,7 @@ fn workload() -> Vec<Op> {
 fn sync_and_group_commit_wals_are_byte_identical() {
     let d_sync = dir("gc-parity-sync");
     {
-        let mut db = Db::open(Config::new(d_sync.clone())).unwrap();
+        let db = Db::open(Config::new(d_sync.clone())).unwrap();
         for op in &workload() {
             db.write(std::slice::from_ref(op)).unwrap();
         }

@@ -69,7 +69,7 @@ fn m21_01_attribution_accounting_closes_within_10pct() {
     cfg.memtable_bytes = 16 * 1024; // force flushes — the segment paths exist
     cfg.l0_compact_trigger = 0; // no merge: the walk visits every segment
     cfg.block_target = 2048; // one row per block — the miss pins are exact
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
 
     // 36 segment keys (flushed out explicitly): 30 warmed `k/` keys, then
     // 6 unwarmed keys under a far prefix (`z/` — their block is never
@@ -135,7 +135,7 @@ fn m21_02_attribution_memtable_hit_leg() {
     let path = tmp("attrib-memtable");
     let mut cfg = Config::new(path.clone());
     cfg.memtable_bytes = usize::MAX; // nothing flushes — every get a hit
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for i in 0..50 {
         db.put(&key(i), &row(b'm')).unwrap();
     }
@@ -176,7 +176,7 @@ fn m21_03_attribution_cache_hit_leg() {
     let path = tmp("attrib-cachehit");
     let mut cfg = Config::new(path.clone());
     cfg.memtable_bytes = usize::MAX;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for i in 0..50 {
         db.put(&key(i), &row(b'c')).unwrap();
     }
@@ -221,7 +221,7 @@ fn m21_04_attribution_cache_miss_leg() {
     cfg.memtable_bytes = usize::MAX;
     cfg.cache_bytes = 4096; // attached: every get consults the cache and misses
     cfg.block_target = 2048; // one row per block → every get reads its own block
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for i in 0..100 {
         db.put(&key(i), &row(b'x')).unwrap();
     }
@@ -258,7 +258,7 @@ fn m21_05_merged_segment_reads_are_cached_and_counted() {
     let path = tmp("attrib-merged");
     let mut cfg = Config::new(path.clone());
     cfg.memtable_bytes = usize::MAX;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for i in 0..50 {
         db.put(&key(i), &row(b'g')).unwrap();
     }

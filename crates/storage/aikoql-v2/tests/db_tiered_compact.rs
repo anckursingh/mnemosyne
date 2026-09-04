@@ -20,7 +20,7 @@ use common::dir;
 /// is exact. (Measured geometry: flush file ~690 B, a merged file is
 /// ~0.77x the sum of its sources — per-file header/index/bloom overhead
 /// collapses at merge.)
-fn round_put(db: &mut Db, r: usize) {
+fn round_put(db: &Db, r: usize) {
     for i in 0..8 {
         let k = format!("k{r:03}{i:02}").into_bytes();
         let v = format!("v{r:03}{i:02}{}", "y".repeat(34)).into_bytes();
@@ -61,22 +61,22 @@ fn tiered_trigger_skips_small_l0() {
     let d = dir("tiered-skip");
     let mut cfg = Config::new(d.clone());
     cfg.memtable_bytes = 512;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for r in 1..=8 {
-        round_put(&mut db, r);
+        round_put(&db, r);
     }
     assert_eq!(seg_count(&d), 1, "round 8: 4F vs 4F must merge");
     for r in 9..=12 {
-        round_put(&mut db, r);
+        round_put(&db, r);
     }
     assert_eq!(seg_count(&d), 5, "round 12: 4F vs 8F must be skipped");
     assert_eq!(levels(&d), vec![0, 0, 0, 0, 1], "one L1 + four L0");
-    round_put(&mut db, 13);
+    round_put(&db, 13);
     assert_eq!(seg_count(&d), 6, "round 13: still below L1 size");
-    round_put(&mut db, 14);
+    round_put(&db, 14);
     assert_eq!(seg_count(&d), 1, "round 14: 6F clears L1");
     for r in 15..=20 {
-        round_put(&mut db, r);
+        round_put(&db, r);
     }
     assert_eq!(seg_count(&d), 7, "round 20: 6F vs 14F must be skipped");
 }
@@ -92,9 +92,9 @@ fn tiered_skip_reads_walk_unmerged_l0() {
     let d = dir("tiered-reads");
     let mut cfg = Config::new(d.clone());
     cfg.memtable_bytes = 512;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for r in 1..=12 {
-        round_put(&mut db, r);
+        round_put(&db, r);
         if r == 10 {
             let v2 = format!("v2{}", "z".repeat(40)).into_bytes();
             db.put(b"k00100", &v2).unwrap();
@@ -135,9 +135,9 @@ fn tiered_ratio_zero_is_count_only() {
     let mut cfg = Config::new(d.clone());
     cfg.memtable_bytes = 512;
     cfg.l0_tier_ratio = 0;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for r in 1..=20 {
-        round_put(&mut db, r);
+        round_put(&db, r);
         if r % 4 == 0 {
             assert_eq!(seg_count(&d), 1, "round {r}: count-only must merge");
         }
@@ -152,15 +152,15 @@ fn tiered_ratio_zero_is_count_only() {
     let mut cfg = Config::new(d.clone());
     cfg.memtable_bytes = 512;
     cfg.l0_tier_ratio = 2;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for r in 1..=12 {
-        round_put(&mut db, r);
+        round_put(&db, r);
     }
     assert_eq!(seg_count(&d), 1, "round 12: 4F >= L1/2 must merge");
     for r in 13..=16 {
-        round_put(&mut db, r);
+        round_put(&db, r);
     }
     assert_eq!(seg_count(&d), 5, "round 16: 4F < L1/2 must be skipped");
-    round_put(&mut db, 17);
+    round_put(&db, 17);
     assert_eq!(seg_count(&d), 1, "round 17: 5F clears L1/2");
 }

@@ -75,7 +75,7 @@ fn merged_iterator_correctness() {
 
     let mut cfg = Config::new(dir("merged-correctness"));
     cfg.memtable_bytes = usize::MAX; // layer churn is deterministic below
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     let mut oracle = Oracle::default();
     let mut rng = Rng(0x51ed_2701_4adf_05e5);
     let prefixes: [&[u8]; 3] = [b"key-0", b"key-1", b"key-2"];
@@ -128,8 +128,8 @@ fn prefix_isolation() {
 
     let mut cfg = Config::new(dir("prefix-isolation"));
     cfg.memtable_bytes = usize::MAX;
-    let mut db = Db::open(cfg).unwrap();
-    let mut put = |src: &[u8; 16], i: usize| {
+    let db = Db::open(cfg).unwrap();
+    let put = |src: &[u8; 16], i: usize| {
         let mut dst = [0u8; 16];
         dst[..2].copy_from_slice(&(i as u16).to_be_bytes());
         db.put(&rel_out_key(src, "related", &dst), b"1").unwrap();
@@ -245,12 +245,12 @@ fn scan_amplification_report() {
         eprintln!("SKIPPED (set SE2M12_NIGHTLY=1 to run the scan amplification report)");
         return;
     }
-    let mut db = Db::open(Config::new(dir("scan-amp"))).unwrap();
+    let db = Db::open(Config::new(dir("scan-amp"))).unwrap();
     db.put(b"seed", b"seed").unwrap();
 
     // W4 — one entity's out-edges among 10 entities × 500 relos: rows are
     // entity-contiguous, the scanned entity spans ~2-3 blocks.
-    let mut w4 = Db::open(Config::new(dir("scan-amp-w4"))).unwrap();
+    let w4 = Db::open(Config::new(dir("scan-amp-w4"))).unwrap();
     for entity in 0..10u8 {
         let src = [entity; 16];
         for i in 0..500 {
@@ -270,7 +270,7 @@ fn scan_amplification_report() {
     // W5 — one type's rows among 4 types × 500 koids. The kernel's
     // type/<name>/<koid> shape sorts types contiguous, so the W5 question
     // is whether a type scan touches only its own rows' blocks.
-    let mut w5 = Db::open(Config::new(dir("scan-amp-w5"))).unwrap();
+    let w5 = Db::open(Config::new(dir("scan-amp-w5"))).unwrap();
     for i in 0..500u32 {
         let mut koid = [0u8; 16];
         koid[..4].copy_from_slice(&i.to_be_bytes());

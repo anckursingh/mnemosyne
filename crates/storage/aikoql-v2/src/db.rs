@@ -242,8 +242,9 @@ impl Db {
 
         // Replay the active WAL (create it if this is the first open).
         // No append mode: on Windows FILE_APPEND_DATA handles cannot
-        // SetEndOfFile, and flush truncates the WAL. Single-writer is
-        // enforced anyway (OS lock + &mut self), so writes seek to the end.
+        // SetEndOfFile, and flush truncates the WAL. Writes seek to the
+        // end under the wal lock — the state lock held across a write
+        // (SE-05) keeps exactly one writer in the append window.
         let wal_path = config.dir.join(WAL_FILE);
         let mut wal = OpenOptions::new()
             .create(true)
@@ -338,7 +339,12 @@ impl Db {
     /// One batch, one sequence (design refinement: sequence is per-batch).
     /// GroupCommit mode routes through the commit queue — the same
     /// pipeline, executed by the committer thread one group at a time.
-    pub fn write(&mut self, ops: &[Op]) -> Result<u64, FormatError> {
+    /// PR#2 review SE-05: `&self` — with concurrent writers, the Sync/Async
+    /// path holds the state lock across seq assignment → append → sync →
+    /// apply, mirroring commit_group. That keeps WAL frame order == seq
+    /// order (replay enforces strictly increasing seqs) and apply-before-
+    /// ack visibility. Lock order is state → wal, never the reverse.
+    pub fn write(&self, ops: &[Op]) -> Result<u64, FormatError> {
         if ops.is_empty() {
             return Err(FormatError::Invalid("empty write batch".into()));
         }
@@ -349,12 +355,9 @@ impl Db {
             self.maybe_compact()?;
             return Ok(seq);
         }
-        let seq = {
-            let mut state = self.state.write().unwrap();
-            let seq = state.next_seq;
-            state.next_seq += 1;
-            seq
-        };
+        let mut state = self.state.write().unwrap();
+        let seq = state.next_seq;
+        state.next_seq += 1;
         let frame = encode_frame(seq, ops)?;
         {
             let mut wal = self.wal.lock().unwrap();
@@ -368,24 +371,22 @@ impl Db {
                 self.fsyncs.fetch_add(1, Ordering::SeqCst);
             }
         }
-        {
-            let mut state = self.state.write().unwrap();
-            for op in ops {
-                match op {
-                    Op::Put(k, v) => state.active.apply(k.clone(), seq, Some(v.clone())),
-                    Op::Delete(k) => state.active.apply(k.clone(), seq, None),
-                }
-            }
-            if state.active.bytes() >= self.config.memtable_bytes {
-                Self::flush_locked_impl(
-                    &self.config,
-                    &self.wal,
-                    &mut state,
-                    &self.cache,
-                    &self.stats,
-                )?;
+        for op in ops {
+            match op {
+                Op::Put(k, v) => state.active.apply(k.clone(), seq, Some(v.clone())),
+                Op::Delete(k) => state.active.apply(k.clone(), seq, None),
             }
         }
+        if state.active.bytes() >= self.config.memtable_bytes {
+            Self::flush_locked_impl(
+                &self.config,
+                &self.wal,
+                &mut state,
+                &self.cache,
+                &self.stats,
+            )?;
+        }
+        drop(state);
         self.maybe_compact()?;
         Ok(seq)
     }
@@ -399,7 +400,7 @@ impl Db {
     /// `l0_tier_ratio` (L1 empty always merges; 0 = count-only M10), so a
     /// growing bulk seed merges at 4, 8, 16, 32… flushes instead of every
     /// 4th — write amplification ~O(n log n) instead of quadratic.
-    fn maybe_compact(&mut self) -> Result<(), FormatError> {
+    fn maybe_compact(&self) -> Result<(), FormatError> {
         if self.config.l0_compact_trigger == 0 {
             return Ok(());
         }
@@ -448,11 +449,11 @@ impl Db {
         self.fsyncs.load(Ordering::SeqCst)
     }
 
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<u64, FormatError> {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<u64, FormatError> {
         self.write(&[Op::Put(key.to_vec(), value.to_vec())])
     }
 
-    pub fn delete(&mut self, key: &[u8]) -> Result<u64, FormatError> {
+    pub fn delete(&self, key: &[u8]) -> Result<u64, FormatError> {
         self.write(&[Op::Delete(key.to_vec())])
     }
 
@@ -645,7 +646,7 @@ impl Db {
     /// Flush's first half, public so the visibility contract is testable:
     /// the active memtable becomes immutable (reads keep seeing it) and a
     /// fresh active takes new writes. flush() = rotate + publish.
-    pub fn rotate(&mut self) {
+    pub fn rotate(&self) {
         let mut state = self.state.write().unwrap();
         if state.active.is_empty() {
             return;
@@ -654,7 +655,7 @@ impl Db {
         state.immutables.push(fresh);
     }
 
-    pub fn flush(&mut self) -> Result<(), FormatError> {
+    pub fn flush(&self) -> Result<(), FormatError> {
         let mut state = self.state.write().unwrap();
         Self::flush_locked_impl(
             &self.config,
@@ -754,7 +755,17 @@ impl Db {
     /// state — compaction is state-preserving. Memtables are not
     /// compaction material: they are newer than every segment and read
     /// first anyway.
-    pub fn compact(&mut self) -> Result<CompactStats, FormatError> {
+    pub fn compact(&self) -> Result<CompactStats, FormatError> {
+        // PR#2 review SE-05: with write(&self), two callers can pass
+        // maybe_compact's trigger check concurrently and both merge.
+        // compact_with serializes them on the state lock; this pre-check
+        // skips the common redundant single-segment re-merge. Advisory, not
+        // atomic — missing it costs one redundant merge, never correctness —
+        // so the policy path (compact_with on a single segment is a caller's
+        // explicit request) keeps its own is_empty guard.
+        if self.state.read().unwrap().segments.len() <= 1 {
+            return Ok(CompactStats::default());
+        }
         self.compact_with(&KeepAll)
     }
 
@@ -763,10 +774,7 @@ impl Db {
     /// are genuinely obsolete (superseded heads, tombstoned keys); the
     /// engine stays key-space-generic. ARCHIVE rows land in
     /// `archive/ARCHIVE-{id:06}.seg` and leave the live key space.
-    pub fn compact_with(
-        &mut self,
-        policy: &dyn RetentionPolicy,
-    ) -> Result<CompactStats, FormatError> {
+    pub fn compact_with(&self, policy: &dyn RetentionPolicy) -> Result<CompactStats, FormatError> {
         let mut state = self.state.write().unwrap();
         if state.segments.is_empty() {
             return Ok(CompactStats::default());
@@ -1020,10 +1028,10 @@ fn committer_loop(
 }
 
 /// Commit one group: assign seqs, append every frame, ONE fsync, apply,
-/// ack — all under one state write-lock (the same exclusivity Sync's
-/// write() gets via &mut self), so a flush can never interleave the
-/// append-and-apply window. Lock order is always state → wal, and the
-/// wal lock is never held across a flush.
+/// ack — all under one state write-lock, exactly like Sync's write()
+/// (SE-05), so a flush can never interleave the append-and-apply window.
+/// Lock order is always state → wal, and the wal lock is never held
+/// across a flush.
 fn commit_group(
     group: &[Batch],
     wal: &Arc<Mutex<File>>,

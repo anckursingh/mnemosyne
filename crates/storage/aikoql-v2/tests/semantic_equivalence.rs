@@ -119,7 +119,7 @@ impl Oracle {
 fn build_gate(d: &Path) -> (Db, Oracle) {
     let mut cfg = Config::new(d.to_path_buf());
     cfg.memtable_bytes = 1024; // interleaved auto-flushes — real merges
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     let mut oracle = Oracle {
         live: HashMap::new(),
         dead: Vec::new(),
@@ -202,7 +202,7 @@ fn build_gate(d: &Path) -> (Db, Oracle) {
 #[test]
 fn semantic_equivalence_keep_all() {
     let d = dir("sem-eq-keep");
-    let (mut db, oracle) = build_gate(&d);
+    let (db, oracle) = build_gate(&d);
     oracle.verify(&db);
 
     // Head preserved: A's head is the 100th update's head; B's untouched.
@@ -284,7 +284,7 @@ impl RetentionPolicy for DropObjA {
 #[test]
 fn retention_drop_removes_only_marked_keys() {
     let d = dir("sem-eq-drop");
-    let (mut db, oracle) = build_gate(&d);
+    let (db, oracle) = build_gate(&d);
     let stats = db.compact_with(&DropObjA).unwrap();
     assert_eq!(stats.entries_archived, 0);
     assert_eq!(
@@ -368,7 +368,7 @@ fn archive_segments(d: &Path) -> Vec<std::path::PathBuf> {
 #[test]
 fn retention_archive_preserves_dropped_rows() {
     let d = dir("sem-eq-archive");
-    let (mut db, _oracle) = build_gate(&d);
+    let (db, _oracle) = build_gate(&d);
     let stats = db.compact_with(&ArchiveObjA).unwrap();
     assert_eq!(stats.entries_archived, UPDATES, "all 100 rows archived");
 
@@ -411,7 +411,7 @@ fn retention_archive_preserves_dropped_rows() {
 #[test]
 fn tombstone_never_resurrects() {
     let d = dir("sem-eq-tomb");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"k", b"v").unwrap();
     db.flush().unwrap();
     db.compact().unwrap(); // L1: k=v

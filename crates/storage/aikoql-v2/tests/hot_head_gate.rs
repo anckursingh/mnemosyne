@@ -53,7 +53,7 @@ fn hot_head_gate() {
 
     let mut cfg = Config::new(dir("hot-head"));
     cfg.memtable_bytes = usize::MAX; // one explicit flush below
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     db.put(&target, &target_value).unwrap();
     for i in 0..FILLERS {
         // Fillers spread over the koid space so the segment is genuinely

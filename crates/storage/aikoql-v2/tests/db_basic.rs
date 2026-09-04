@@ -16,7 +16,7 @@ fn open(tag: &str) -> (Db, PathBuf) {
 
 #[test]
 fn put_get_visible() {
-    let (mut db, _d) = open("basic-put");
+    let (db, _d) = open("basic-put");
     assert_eq!(db.put(b"k1", b"v1").unwrap(), 1);
     assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(db.get(b"missing").unwrap(), None);
@@ -24,7 +24,7 @@ fn put_get_visible() {
 
 #[test]
 fn overwrite_returns_head() {
-    let (mut db, _d) = open("basic-overwrite");
+    let (db, _d) = open("basic-overwrite");
     db.put(b"k1", b"v1").unwrap();
     assert_eq!(db.put(b"k1", b"v2").unwrap(), 2);
     assert_eq!(db.get(b"k1").unwrap(), Some(b"v2".to_vec()));
@@ -32,7 +32,7 @@ fn overwrite_returns_head() {
 
 #[test]
 fn delete_hides_key() {
-    let (mut db, _d) = open("basic-delete");
+    let (db, _d) = open("basic-delete");
     db.put(b"k1", b"v1").unwrap();
     assert_eq!(db.delete(b"k1").unwrap(), 2);
     assert_eq!(db.get(b"k1").unwrap(), None);
@@ -43,7 +43,7 @@ fn delete_hides_key() {
 
 #[test]
 fn seqs_are_per_batch() {
-    let (mut db, _d) = open("basic-seq");
+    let (db, _d) = open("basic-seq");
     assert_eq!(db.put(b"a", b"1").unwrap(), 1);
     assert_eq!(
         db.write(&[
@@ -62,12 +62,12 @@ fn seqs_are_per_batch() {
 fn reopen_recovers_unflushed_from_wal() {
     let d = dir("basic-reopen");
     {
-        let mut db = Db::open(Config::new(d.clone())).unwrap();
+        let db = Db::open(Config::new(d.clone())).unwrap();
         db.put(b"k1", b"v1").unwrap();
         db.put(b"k2", b"v2").unwrap();
         db.delete(b"k1").unwrap(); // tombstone must survive reopen
     } // Drop does NOT flush — recovery is the WAL's job
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     assert_eq!(db.get(b"k1").unwrap(), None);
     assert_eq!(db.get(b"k2").unwrap(), Some(b"v2".to_vec()));
     assert_eq!(

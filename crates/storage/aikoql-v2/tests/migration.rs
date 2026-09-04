@@ -144,7 +144,7 @@ fn migrate_empty_wal_creates_fresh_v2() {
     assert_eq!(report.batches, 0);
     assert_eq!(report.keys, 0);
 
-    let mut db = Db::open(Config::new(dest)).unwrap();
+    let db = Db::open(Config::new(dest)).unwrap();
     assert_eq!(db.put(b"k1", b"v1").unwrap(), 1);
     assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
 }

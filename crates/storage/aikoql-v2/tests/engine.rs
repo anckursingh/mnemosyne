@@ -8,8 +8,12 @@
 mod common;
 
 use aikoql_kernel::storage::store::{StorageEngine, WriteBatch};
+use aikoql_storage_v2::db::{Config, DurabilityMode};
 use aikoql_storage_v2::AikoqlStorageEngineV2;
 use common::{kse, tmp};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[test]
 fn kse001_get() {
@@ -77,4 +81,60 @@ fn multi_put_batch_last_wins_and_is_atomic() {
     let e = AikoqlStorageEngineV2::open(&path).unwrap();
     assert_eq!(e.get(b"d").unwrap(), Some(vec![2]));
     assert_eq!(e.get(b"e").unwrap(), Some(vec![3]));
+}
+
+/// PR#2 review SE-05: 32 concurrent StorageEngine writers through the
+/// ADAPTER, GroupCommit enabled. The old adapter held `RwLock<Db>` and
+/// serialized write_batch before the commit queue ever saw a second batch
+/// — group size ≈ 1, one fsync per batch (32 here). The refactored adapter
+/// holds the Db directly: the barrier releases all 32 within microseconds
+/// of each other and the 200 ms drain window must coalesce them into ONE
+/// group (default caps 4096 ops / 16 MiB — no cap split). The fsync count
+/// IS the group-size evidence; recovery correctness closes the review's
+/// checklist.
+#[test]
+fn se05_adapter_does_not_defeat_group_commit() {
+    let path = tmp("engine-gc32");
+    let mut cfg = Config::new(PathBuf::from(&path));
+    cfg.durability = DurabilityMode::GroupCommit; // explicit opt-in, never silent
+    cfg.max_wait_duration = Duration::from_millis(200); // long window
+    let e = Arc::new(AikoqlStorageEngineV2::open_with_config(cfg).unwrap());
+    let barrier = Arc::new(std::sync::Barrier::new(32));
+    let threads: Vec<_> = (0..32u64)
+        .map(|i| {
+            let e = Arc::clone(&e);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let mut b = WriteBatch::new();
+                b.put(format!("k{i}").into_bytes(), format!("v{i}").into_bytes());
+                barrier.wait(); // all writers hit the queue within µs
+                e.write_batch(&b).unwrap();
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(
+        e.fsync_count(),
+        1,
+        "one fsync for all 32 batches — the adapter must not serialize \
+         writers before the commit queue (32 would mean a group of one)"
+    );
+    // Ack implies apply: every batch's key is visible through the adapter.
+    for i in 0..32u64 {
+        assert_eq!(
+            e.get(&format!("k{i}").into_bytes()).unwrap(),
+            Some(format!("v{i}").into_bytes())
+        );
+    }
+    drop(e); // drops the Db — the committer commits pending and is joined
+    let e = AikoqlStorageEngineV2::open(&path).unwrap();
+    for i in 0..32u64 {
+        assert_eq!(
+            e.get(&format!("k{i}").into_bytes()).unwrap(),
+            Some(format!("v{i}").into_bytes()),
+            "recovery serves all 32 keys after reopen"
+        );
+    }
 }

@@ -82,7 +82,7 @@ fn block_v2_lookup_bounded() {
     let mut cfg = Config::new(dir("blockv2-bounded"));
     cfg.memtable_bytes = usize::MAX;
     cfg.block_target = 1 << 20; // one block for the whole dataset
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for i in 0..N {
         if i % 2 == 0 {
             db.put(format!("key-{i:06}").as_bytes(), &[b'v'; 16][..])

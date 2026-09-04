@@ -66,7 +66,7 @@ fn get_does_not_stall_writers_during_disk_read() {
     cfg.cache_bytes = 0;
     cfg.block_target = 1 << 30; // one block per segment
     cfg.memtable_bytes = usize::MAX;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     let target = passing_key();
     for i in 0..SEGS {
         // ponytail: constant-fill values — compression is none (segment.rs),
@@ -125,7 +125,7 @@ fn compaction_trigger_bounds_candidates() {
     let mut cfg = Config::new(d.clone());
     cfg.memtable_bytes = 16; // every put flushes its own L0 segment
     cfg.cache_bytes = 0;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for i in 0..4 {
         db.put(format!("k{i}").as_bytes(), b"v").unwrap();
     }
@@ -176,7 +176,7 @@ fn explicit_flush_never_triggers_compaction() {
     let d = dir("m10-flush-no-trigger");
     let mut cfg = Config::new(d.clone());
     cfg.memtable_bytes = usize::MAX;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for i in 0..4 {
         db.put(format!("k{i}").as_bytes(), b"v").unwrap();
         db.flush().unwrap();

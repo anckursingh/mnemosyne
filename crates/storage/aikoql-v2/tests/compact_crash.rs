@@ -73,7 +73,7 @@ fn ops() -> Vec<(bool, Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-fn run_workload_then_compact(db: &mut Db) {
+fn run_workload_then_compact(db: &Db) {
     for (put, k, v) in ops() {
         if put {
             db.put(&k, &v).unwrap();
@@ -104,7 +104,7 @@ fn segment_file_count(d: &Path) -> usize {
 /// Reopen after the kill: every key holds its expected value, nothing was
 /// acked that is lost, nothing phantom — and the sequence resumes at 121.
 fn verify(d: &Path) {
-    let mut db = Db::open(Config::new(d.to_path_buf())).unwrap();
+    let db = Db::open(Config::new(d.to_path_buf())).unwrap();
     for (k, want) in &expected() {
         assert_eq!(
             db.get(k).unwrap(),
@@ -134,8 +134,8 @@ fn compact_crash_after_segment_before_manifest() {
         // SE2-M10: these children pin the EXPLICIT compact's windows — an
         // auto-triggered compact would park at the env stage mid-workload.
         cfg.l0_compact_trigger = 0;
-        let mut db = Db::open(cfg).unwrap();
-        run_workload_then_compact(&mut db);
+        let db = Db::open(cfg).unwrap();
+        run_workload_then_compact(&db);
         unreachable!("the parent kills the parked child");
     }
     let d = dir("compact-crash-seg");
@@ -177,8 +177,8 @@ fn compact_crash_after_manifest_before_current() {
         // SE2-M10: these children pin the EXPLICIT compact's windows — an
         // auto-triggered compact would park at the env stage mid-workload.
         cfg.l0_compact_trigger = 0;
-        let mut db = Db::open(cfg).unwrap();
-        run_workload_then_compact(&mut db);
+        let db = Db::open(cfg).unwrap();
+        run_workload_then_compact(&db);
         unreachable!("the parent kills the parked child");
     }
     let d = dir("compact-crash-manifest");
@@ -215,8 +215,8 @@ fn compact_crash_after_current_before_deletion() {
         // SE2-M10: these children pin the EXPLICIT compact's windows — an
         // auto-triggered compact would park at the env stage mid-workload.
         cfg.l0_compact_trigger = 0;
-        let mut db = Db::open(cfg).unwrap();
-        run_workload_then_compact(&mut db);
+        let db = Db::open(cfg).unwrap();
+        run_workload_then_compact(&db);
         unreachable!("the parent kills the parked child");
     }
     let d = dir("compact-crash-current");

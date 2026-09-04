@@ -12,7 +12,7 @@ use std::io::Write;
 #[test]
 fn writes_visible_during_flush() {
     let d = dir("flush-visible");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"k1", b"v1").unwrap();
     db.rotate(); // flush's first half: active → immutable
     db.put(b"k2", b"v2").unwrap(); // lands in the fresh active
@@ -31,7 +31,7 @@ fn writes_visible_during_flush() {
 #[test]
 fn flush_publishes_segment_manifest_and_truncates_wal() {
     let d = dir("flush-publish");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"k1", b"v1").unwrap();
     db.put(b"k2", b"v2").unwrap();
     db.put(b"k3", b"v3").unwrap();
@@ -65,7 +65,7 @@ fn threshold_triggers_flush() {
     let d = dir("flush-threshold");
     let mut cfg = Config::new(d.clone());
     cfg.memtable_bytes = 64;
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for i in 0..5u64 {
         db.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes())
             .unwrap();
@@ -98,7 +98,7 @@ fn crash_window_replay_is_idempotent() {
     // the WAL still holds the flushed batches. Replay must not duplicate
     // state — same (key, seq) → same value, no sequence reuse.
     let d = dir("flush-window");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     assert_eq!(db.put(b"k1", b"v1").unwrap(), 1);
     db.flush().unwrap();
     assert_eq!(std::fs::metadata(d.join(WAL_FILE)).unwrap().len(), 0);
@@ -113,7 +113,7 @@ fn crash_window_replay_is_idempotent() {
     drop(wal);
     drop(db);
 
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(
         db.put(b"k2", b"v2").unwrap(),
@@ -126,7 +126,7 @@ fn crash_window_replay_is_idempotent() {
 #[test]
 fn newer_memtable_shadows_flushed_segment() {
     let d = dir("flush-shadow");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"k1", b"v1").unwrap();
     db.flush().unwrap();
     assert_eq!(db.put(b"k1", b"v2").unwrap(), 2);
@@ -147,7 +147,7 @@ fn equal_key_versions_survive_flush() {
     let d = dir("flush-equal-keys");
     let mut cfg = Config::new(d.clone());
     cfg.memtable_bytes = 1 << 30; // no auto-flush — versions accumulate
-    let mut db = Db::open(cfg).unwrap();
+    let db = Db::open(cfg).unwrap();
     for i in 0..20u64 {
         db.put(b"head/x", format!("v{i:02}").as_bytes()).unwrap();
     }

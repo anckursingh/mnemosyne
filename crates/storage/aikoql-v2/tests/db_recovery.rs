@@ -14,7 +14,7 @@ use std::io::Write;
 #[test]
 fn reopen_touches_only_manifest_and_active_wal() {
     let d = dir("rec-touch");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"k1", b"v1").unwrap();
     db.put(b"k2", b"v2").unwrap();
     db.put(b"k3", b"v3").unwrap();
@@ -56,7 +56,7 @@ fn reopen_touches_only_manifest_and_active_wal() {
 #[test]
 fn reopen_replays_only_the_active_wal() {
     let d = dir("rec-active");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     for i in 1..=3u64 {
         db.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes())
             .unwrap();
@@ -72,7 +72,7 @@ fn reopen_replays_only_the_active_wal() {
     );
     drop(db);
 
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     for i in 1..=4u64 {
         assert_eq!(
             db.get(format!("k{i}").as_bytes()).unwrap(),
@@ -89,7 +89,7 @@ fn reopen_replays_only_the_active_wal() {
 #[test]
 fn missing_segment_fails_closed() {
     let d = dir("rec-missing");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"k1", b"v1").unwrap();
     db.flush().unwrap();
     drop(db);
@@ -107,7 +107,7 @@ fn missing_segment_fails_closed() {
 #[test]
 fn orphan_segment_reported_not_fatal() {
     let d = dir("rec-orphan");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"k1", b"v1").unwrap();
     db.flush().unwrap();
     drop(db);
@@ -119,7 +119,7 @@ fn orphan_segment_reported_not_fatal() {
     let manifest = Manifest::read(&manifest_path(&d, current.manifest_generation)).unwrap();
     assert_eq!(orphan_segments(&d, &manifest), vec![999]);
 
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(
         db.put(b"k2", b"v2").unwrap(),
@@ -137,7 +137,7 @@ fn orphan_segment_reported_not_fatal() {
 #[test]
 fn corrupt_manifest_fails_closed() {
     let d = dir("rec-manifest");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"k1", b"v1").unwrap();
     db.flush().unwrap();
     drop(db);
@@ -160,7 +160,7 @@ fn corrupt_wal_with_valid_tail_fails_closed() {
     // KSE-082B verbatim at the Db boundary: damage followed by a valid
     // frame is middle corruption, not a crash tail to truncate.
     let d = dir("rec-082b");
-    let mut db = Db::open(Config::new(d.clone())).unwrap();
+    let db = Db::open(Config::new(d.clone())).unwrap();
     db.put(b"k1", b"v1").unwrap();
     db.put(b"k2", b"v2").unwrap();
     drop(db);

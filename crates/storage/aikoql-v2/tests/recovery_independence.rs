@@ -36,7 +36,7 @@ fn recovery_independence_10gib_segments_100mib_wal() {
     let mut cfg = Config::new(a.clone());
     cfg.memtable_bytes = 2 * GIB; // no auto-flush mid-fabrication
     {
-        let mut db = Db::open(cfg).unwrap();
+        let db = Db::open(cfg).unwrap();
         let value = vec![b'x'; MIB];
         for i in 0..100u64 {
             db.put(format!("w{i:03}").as_bytes(), &value).unwrap();
@@ -88,10 +88,10 @@ fn recovery_independence_10gib_segments_100mib_wal() {
 
     // 4. Measure. Correctness asserts only — timing is a report cell.
     let t0 = Instant::now();
-    let mut db = Db::open(Config::new(a.clone())).unwrap();
+    let db = Db::open(Config::new(a.clone())).unwrap();
     let open_ms = t0.elapsed().as_millis();
     let t0 = Instant::now();
-    let mut control = Db::open(Config::new(b.clone())).unwrap();
+    let control = Db::open(Config::new(b.clone())).unwrap();
     let control_ms = t0.elapsed().as_millis();
 
     let want = vec![b'x'; MIB];
