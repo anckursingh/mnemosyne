@@ -203,7 +203,7 @@ fn main() {
     let model_dir_flag = cfg.model_dir;
     MEMORY_DIR.set(memory_dir).ok();
 
-    let kernel = match engine::open_kernel(&db_path, &cfg.encryption) {
+    let kernel = match engine::open_kernel(&db_path, &cfg.encryption, cfg.backend) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("open kernel: {}", e);

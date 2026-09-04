@@ -1,7 +1,16 @@
 //! AIKOQL-native storage engine (MRFC-KSE-001).
 //!
-//! Experimental backend behind the kernel's `StorageEngine` trait — never the
-//! production default unless the measured adoption gate passes (TDD doc §29).
+//! Experimental backend behind the kernel's `StorageEngine` trait. The
+//! adoption gate passed (TDD doc §29; artifacts/storage-engine/) and aikoql
+//! served as the production default for one cycle; PR#2 external review
+//! (SE-03) reverted that default: open replays the FULL WAL (startup time
+//! and memory are O(WAL size)) and the WAL grows unbounded — there is no
+//! checkpointing. Deployment boundary: aikoql suits query-heavy,
+//! RAM-affordant, bounded datasets; opt in via `--backend aikoql` /
+//! `AIKOQL_BACKEND=aikoql` / `storage.backend = "aikoql"`
+//! (docs/STORAGE-BACKENDS.md). Re-adoption as default requires
+//! checkpointing with bounded replay plus a redb → aikoql migration story
+//! (artifacts/storage-engine/adoption-decision.md addendum).
 //!
 //! KSE-1 skeleton: an append-only write-ahead log over the kernel's
 //! `MemoryEngine` reference semantics. Each batch is serialized to one

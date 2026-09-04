@@ -15,3 +15,21 @@ Scale: 100000 KOs / 10000 deep × 10 versions (M7_NIGHTLY — strict opt-in).
 ## Verdict
 
 ADOPT AIKOQL STORAGE ENGINE
+
+## Addendum (2026-09-04, PR#2 external review SE-03): default reverted to redb
+
+The verdict above adopted aikoql as the production default (MCP open path).
+PR#2 review (head `cafb8a4`) rejected that default: open is O(WAL size) in
+time and memory and the WAL grows unbounded — no checkpointing. Fix A (do
+not make v1 the default) is applied: redb is the default again,
+`aikoql`/`aikoql-v2` are explicit opt-ins, and format auto-detection keeps
+existing databases working in both directions (docs/STORAGE-BACKENDS.md).
+
+Re-adoption conditions — evidenced, not asserted:
+
+1. checkpointing with bounded replay: startup independent of WAL size, with
+   the acceptance regression test (write → restart → checkpoint → restart →
+   assert replay bounded);
+2. redb → aikoql migration exercised at scale (streaming, SE-04);
+3. a fresh gate matrix against redb at the then-current scale.
+
