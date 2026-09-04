@@ -34,7 +34,11 @@
 //! loader child.
 //!
 //! Writes `artifacts/storage-engine-v2/workloads.md` (the §28 matrix +
-//! the §26 gate table).
+//! the §26 gate table) and `artifacts/storage-engine-v2/result.json`
+//! (PR#2 review SE-11: the same evidence plus run metadata as
+//! machine-readable JSON for automated comparison) — both only at
+//! `V2ADOPT_NIGHTLY=1`, so a smoke run never clobbers the canonical
+//! artifacts (SE2-M19).
 
 mod common;
 
@@ -638,6 +642,23 @@ fn gate_cell(g: Option<bool>) -> &'static str {
     }
 }
 
+/// Gate-5 evidence: the v2 KO-lookup P50 slowdown vs the v1 baseline.
+/// The verdict is nightly-gated; the ratios are reported on every run.
+/// Shared by the report and result.json (SE-11) so they cannot drift.
+fn gate5_evidence(backends: &[BackendResult]) -> (Option<bool>, Option<f64>, Option<f64>) {
+    let v2 = backends.iter().find(|b| b.name == "aikoql-v2").unwrap();
+    let aik = backends.iter().find(|b| b.name == "aikoql").unwrap();
+    let (r1, r2) = (
+        p50_ratio(v2, aik, "KO get (W1)"),
+        p50_ratio(v2, aik, "head get (W2)"),
+    );
+    let verdict = nightly().then(|| {
+        r1.is_some_and(|r| r <= GATE5_SLOWDOWN_BOUND)
+            && r2.is_some_and(|r| r <= GATE5_SLOWDOWN_BOUND)
+    });
+    (verdict, r1, r2)
+}
+
 fn benchmark_report(backends: &[BackendResult], sz: Size) -> String {
     let profile = if cfg!(debug_assertions) {
         "debug (CPU inflated; RSS comparable — kse19)"
@@ -649,17 +670,7 @@ fn benchmark_report(backends: &[BackendResult], sz: Size) -> String {
     } else {
         "smoke"
     };
-    let v2 = backends.iter().find(|b| b.name == "aikoql-v2").unwrap();
-    let aik = backends.iter().find(|b| b.name == "aikoql").unwrap();
-    let gate5 = nightly().then(|| {
-        ["KO get (W1)", "head get (W2)"]
-            .iter()
-            .all(|l| p50_ratio(v2, aik, l).is_some_and(|r| r <= GATE5_SLOWDOWN_BOUND))
-    });
-    let (r1, r2) = (
-        p50_ratio(v2, aik, "KO get (W1)"),
-        p50_ratio(v2, aik, "head get (W2)"),
-    );
+    let (gate5, r1, r2) = gate5_evidence(backends);
 
     let mut s = String::new();
     let date = run_date();
@@ -720,6 +731,234 @@ fn benchmark_report(backends: &[BackendResult], sz: Size) -> String {
     s
 }
 
+// ---- SE-11 result.json (PR#2 review) --------------------------------------
+// Benchmark evidence controls ADOPT / NOT ADOPT / default backend, so every
+// result ships machine-readable metadata beside the human report:
+// artifacts/storage-engine-v2/result.json. Hand-built JSON — no serde
+// dependency for one small writer. The helpers mirror the v1 suite's
+// writer (aikoql/tests/kse_m7_workloads.rs).
+
+/// Minimal JSON string escaper — the non-numeric fields are row labels,
+/// backend names and the metadata strings.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `None` → JSON null, `Some(v)` → the value (every optional cell).
+fn opt<T: std::fmt::Display>(o: Option<T>) -> String {
+    match o {
+        Some(v) => v.to_string(),
+        None => "null".into(),
+    }
+}
+
+/// The checked-out revision the run measured — NOT_REPORTED outside a git
+/// tree (e.g. an artifact dir copied away from the repo).
+fn git_sha() -> String {
+    match std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => "NOT_REPORTED".into(),
+    }
+}
+
+fn rustc_version() -> String {
+    match std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => "NOT_REPORTED".into(),
+    }
+}
+
+/// PROCESSOR_IDENTIFIER on Windows, /proc/cpuinfo "model name" on Linux,
+/// NOT_REPORTED where the platform has no cheap stdlib probe.
+fn cpu_model() -> String {
+    if let Ok(id) = std::env::var("PROCESSOR_IDENTIFIER") {
+        return id;
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+        if let Some(l) = cpuinfo.lines().find(|l| l.starts_with("model name")) {
+            if let Some((_, v)) = l.split_once(':') {
+                return v.trim().to_string();
+            }
+        }
+    }
+    "NOT_REPORTED".into()
+}
+
+/// Physical RAM in bytes — /proc/meminfo on Linux, the suite's established
+/// PowerShell-sampler pattern on Windows (kse19); None where unmeasurable.
+fn ram_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let total = meminfo.lines().find(|l| l.starts_with("MemTotal"))?;
+        let kb = total.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+        return Some(kb * 1024);
+    }
+    #[cfg(windows)]
+    {
+        let script = "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory";
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", script])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .ok()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
+/// Filesystem type of the artifact dir — `stat -f` on Linux, NOT_REPORTED
+/// where the platform has no cheap stdlib probe (Windows).
+fn filesystem(dir: &Path) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let out = std::process::Command::new("stat")
+            .args(["-f", "-c", "%T"])
+            .arg(dir)
+            .output();
+        if let Ok(o) = out {
+            if o.status.success() {
+                return String::from_utf8_lossy(&o.stdout).trim().to_string();
+            }
+        }
+    }
+    let _ = dir;
+    "NOT_REPORTED".into()
+}
+
+/// PR#2 review SE-11: machine-readable metadata + the measured rows for
+/// automated comparison of the runs that decide V2 adoption. Only the
+/// suite's own knobs are reported as env vars — a full environment dump
+/// would leak credentials (e.g. AIKOQL_TCP_TOKEN).
+fn result_json(backends: &[BackendResult], sz: Size) -> String {
+    let args = std::env::args().collect::<Vec<_>>().join(" ");
+    let (gate5, r1, r2) = gate5_evidence(backends);
+    // The suite opens the engine at the v2 defaults (engine.rs:
+    // AikoqlStorageEngineV2::open → Config::new) — report the live
+    // default values, not hardcoded ones.
+    let cfg = Config::new(PathBuf::new());
+    let env_vars = format!(
+        "{{ {}: {}, {}: {} }}",
+        json_str(NIGHTLY_ENV),
+        json_str(&std::env::var(NIGHTLY_ENV).unwrap_or_else(|_| "unset".into())),
+        json_str(LOADER_ENV),
+        json_str(&std::env::var(LOADER_ENV).unwrap_or_else(|_| "unset".into())),
+    );
+    let mut s = String::new();
+    s.push_str("{\n");
+    s.push_str(&format!(
+        " \"suite\": {},\n \"generated\": {},\n",
+        json_str("M7 W1..W8 workloads on v2 (MRFC-KSE-001 §27-28 + design §26)"),
+        json_str(&run_date()),
+    ));
+    s.push_str(&format!(
+        " \"environment\": {{ \"git_sha\": {}, \"rustc\": {}, \"os\": {}, \"arch\": {}, \"cpu_model\": {}, \"ram_bytes\": {}, \"filesystem\": {}, \"build\": {}, \"command\": {}, \"env\": {} }},\n",
+        json_str(&git_sha()),
+        json_str(&rustc_version()),
+        json_str(std::env::consts::OS),
+        json_str(std::env::consts::ARCH),
+        json_str(&cpu_model()),
+        opt(ram_bytes()),
+        json_str(&filesystem(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../artifacts/storage-engine-v2")
+        )),
+        json_str(if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }),
+        json_str(&args),
+        env_vars,
+    ));
+    s.push_str(&format!(
+        " \"cache_regime\": {},\n",
+        json_str(&format!(
+            "v2 engine defaults: memtable_bytes={}, cache_bytes={}",
+            cfg.memtable_bytes, cfg.cache_bytes,
+        )),
+    ));
+    s.push_str(&format!(
+        " \"dataset\": {{ \"seed\": {}, \"n\": {}, \"deep\": {}, \"deep_versions\": {}, \"ops\": {}, \"scan_rounds\": {} }},\n",
+        SEED, sz.n, sz.deep, DEEP_VERSIONS, sz.ops, sz.scan_rounds,
+    ));
+    s.push_str(" \"backends\": [\n");
+    for (i, b) in backends.iter().enumerate() {
+        s.push_str(&format!(
+            "  {{ \"name\": {}, \"disk_bytes\": {}, \"seed_wall_ms\": {:.3}, \"rss_peak_bytes\": {}, \"rows\": [",
+            json_str(b.name),
+            b.disk,
+            b.seed_wall_ms,
+            opt(b.rss),
+        ));
+        for (j, r) in b.rows.iter().enumerate() {
+            if j > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(&format!(
+                "{{ \"label\": {}, \"ops\": {}, \"wall_ms\": {:.3}, \"p50_us\": {}, \"p95_us\": {}, \"p99_us\": {}, \"read_bytes\": {}, \"written_bytes\": {} }}",
+                json_str(&r.label),
+                r.ops,
+                r.wall_ms,
+                r.p50,
+                r.p95,
+                r.p99,
+                r.read,
+                r.written,
+            ));
+        }
+        s.push_str(&format!(
+            "] }}{}\n",
+            if i + 1 < backends.len() { "," } else { "" }
+        ));
+    }
+    s.push_str(" ],\n");
+    s.push_str(&format!(
+        " \"gates\": {{ \"gate5_ko_lookup_competitive\": {{ \"verdict\": {}, \"w1_p50_ratio_vs_v1\": {}, \"w2_p50_ratio_vs_v1\": {}, \"bound\": {} }} }}\n",
+        opt(gate5),
+        match r1 {
+            Some(v) => format!("{v:.3}"),
+            None => "null".into(),
+        },
+        match r2 {
+            Some(v) => format!("{v:.3}"),
+            None => "null".into(),
+        },
+        GATE5_SLOWDOWN_BOUND,
+    ));
+    s.push_str("}\n");
+    s
+}
+
 // ---- the suite -----------------------------------------------------------
 
 #[test]
@@ -760,6 +999,9 @@ fn v2_m7_workloads() {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../artifacts/storage-engine-v2");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("workloads.md"), benchmark_report(&results, sz)).unwrap();
+        // SE-11 (PR#2 review): machine-readable twin of workloads.md for
+        // automated comparison (Markdown = human report, JSON = diffable).
+        std::fs::write(dir.join("result.json"), result_json(&results, sz)).unwrap();
     }
 }
 
