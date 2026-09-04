@@ -1,9 +1,23 @@
 //! SE2-M3 — legacy WAL migration (design §23, IMPLEMENTATION-PLAN-V2
 //! SE2-M3): decode the v1 envelope + batch payload, feed the batches into a
 //! fresh v2 Db (segments → manifest → CURRENT by the normal flush path),
-//! reopen and verify every migrated key against the state decoded from the
-//! source — and only then report done. The source WAL is never modified or
-//! deleted: the operator's retention policy decides, the migrator reports.
+//! reopen and verify — and only then report done. The source WAL is never
+//! modified or deleted: the operator's retention policy decides, the
+//! migrator reports.
+//!
+//! PR#2 review SE-04: the migration streams — frames are read in bounded
+//! chunks, decoded one at a time, applied to the destination and verified
+//! against it immediately, then discarded. Memory is O(chunk + largest
+//! frame), never the complete WAL, all decoded batches, or a full
+//! expected-state map. (A corrupted header claiming a huge payload still
+//! grows the carry buffer until EOF fails closed — no worse than the
+//! pre-streaming whole-file read, and the corruption path ends in an error.)
+//!
+//! Verification state is the destination itself: every frame's net effect
+//! is compared against the live Db right after it is applied (stronger than
+//! a running hash — the check is against the destination's actual
+//! post-state), and a state fingerprint taken before close and after reopen
+//! pins the flush/reopen round-trip.
 //!
 //! The envelope parser is v1's own validated reader (`envelope::parse_at` —
 //! magic/version/type/checksum); only the frozen payload codec is
@@ -14,15 +28,24 @@ use crate::db::{Config, Db};
 use crate::format::FormatError;
 use crate::wal::Op;
 use aikoql_storage::envelope::{self, ParseOutcome};
-use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+/// Read-ahead for the streaming pass: memory is bounded by this plus one
+/// frame (a larger frame grows the carry until it completes or EOF fails
+/// closed — see the module doc).
+const CHUNK: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct MigrationReport {
     pub batches: u64,
     pub puts: u64,
     pub deletes: u64,
-    /// Distinct keys in the migrated final state.
+    /// Live keys in the migrated final state (counted on the reopened
+    /// destination — not distinct keys ever written).
     pub keys: u64,
     pub torn_tail_dropped: bool,
     pub source: PathBuf,
@@ -99,48 +122,113 @@ fn valid_record_after(bytes: &[u8], pos: usize) -> bool {
     })
 }
 
+/// Apply one decoded frame to the destination and verify its net effect
+/// against the live Db immediately (SE-04 "update verification state"): the
+/// last op per key within the frame must be the destination's post-state.
+/// Earlier duplicates of a key are skipped — their intermediate states are
+/// not observable once the frame is applied.
+fn apply_and_verify(
+    db: &Db,
+    ops: &[Op],
+    puts: &mut u64,
+    deletes: &mut u64,
+) -> Result<(), FormatError> {
+    for op in ops {
+        match op {
+            Op::Put(..) => *puts += 1,
+            Op::Delete(..) => *deletes += 1,
+        }
+    }
+    db.write(ops)?;
+    let mut seen: HashSet<&[u8]> = HashSet::new();
+    for op in ops.iter().rev() {
+        let (key, want) = match op {
+            Op::Put(k, v) => (&k[..], Some(&v[..])),
+            Op::Delete(k) => (&k[..], None),
+        };
+        if !seen.insert(key) {
+            continue; // overwritten by a later op in this frame
+        }
+        let got = db.get(key)?;
+        if got.as_deref() != want {
+            return Err(FormatError::Corrupt(format!(
+                "frame verification failed for key {}: expected {want:?}, got {got:?}",
+                String::from_utf8_lossy(key)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The destination's complete state as a (live-key count, digest) pair.
+/// DefaultHasher is process-local: the two fingerprints are compared within
+/// one process run, which is the only claim made here.
+/// ponytail: upgrade to sha256 only if the digest is ever reported.
+fn fingerprint(db: &Db) -> Result<(u64, u64), FormatError> {
+    let rows = db.scan(b"")?;
+    let mut hasher = DefaultHasher::new();
+    for (k, v) in &rows {
+        k.len().hash(&mut hasher);
+        k.hash(&mut hasher);
+        v.len().hash(&mut hasher);
+        v.hash(&mut hasher);
+    }
+    Ok((rows.len() as u64, hasher.finish()))
+}
+
 /// Migrate a v1 WAL file into a fresh v2 database (§23 pipeline: decode →
 /// build segments → manifest → atomically publish CURRENT → reopen and
 /// verify → only then report done). The source file is read-only here —
 /// never modified, never deleted.
 pub fn migrate_v1_wal(source: &Path, config: Config) -> Result<MigrationReport, FormatError> {
-    let bytes = std::fs::read(source)
+    let mut file = std::fs::File::open(source)
         .map_err(|e| FormatError::Io(format!("read {}: {e}", source.display())))?;
 
-    let mut batches: Vec<Vec<Op>> = Vec::new();
-    let mut expected: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+    let db = Db::open(config.clone())?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut pos = 0usize; // invariant: bytes before `pos` are consumed frames
+    let mut eof = false;
+    let mut batches = 0u64;
     let mut puts = 0u64;
     let mut deletes = 0u64;
     let mut torn_tail_dropped = false;
-    let mut pos = 0usize;
-    while pos < bytes.len() {
-        match envelope::parse_at(&bytes, pos) {
+    let mut chunk = vec![0u8; CHUNK];
+    loop {
+        match envelope::parse_at(&buf, pos) {
             Ok(ParseOutcome::Complete { payload, end }) => {
                 let ops = decode_legacy_batch(&payload)?;
-                // v1 apply order: puts before dels (KSE-006)
-                for op in &ops {
-                    match op {
-                        Op::Put(k, v) => {
-                            puts += 1;
-                            expected.insert(k.clone(), Some(v.clone()));
-                        }
-                        Op::Delete(k) => {
-                            deletes += 1;
-                            expected.insert(k.clone(), None);
-                        }
-                    }
-                }
-                batches.push(ops);
+                apply_and_verify(&db, &ops, &mut puts, &mut deletes)?;
+                batches += 1;
                 pos = end;
+                if pos >= CHUNK {
+                    buf.drain(..pos); // amortized: only past the read-ahead
+                    pos = 0;
+                }
             }
             Ok(ParseOutcome::TornTail) => {
-                if valid_record_after(&bytes, pos) {
-                    return Err(FormatError::Corrupt(
-                        "truncated record followed by valid data".into(),
-                    ));
+                if eof {
+                    if !buf[pos..].is_empty() {
+                        if valid_record_after(&buf, pos) {
+                            return Err(FormatError::Corrupt(
+                                "truncated record followed by valid data".into(),
+                            ));
+                        }
+                        torn_tail_dropped = true;
+                    }
+                    break;
                 }
-                torn_tail_dropped = true;
-                break;
+                if pos > 0 {
+                    buf.drain(..pos); // compact before growing
+                    pos = 0;
+                }
+                let n = file
+                    .read(&mut chunk)
+                    .map_err(|e| FormatError::Io(format!("read {}: {e}", source.display())))?;
+                if n == 0 {
+                    eof = true;
+                } else {
+                    buf.extend_from_slice(&chunk[..n]);
+                }
             }
             // v1 reports corruption/incompatibility as KError::Store; every
             // reachable case here is damage (the format version is frozen
@@ -148,32 +236,28 @@ pub fn migrate_v1_wal(source: &Path, config: Config) -> Result<MigrationReport, 
             Err(e) => return Err(FormatError::Corrupt(e.to_string())),
         }
     }
+    drop(file);
 
-    // Feed the batches through the normal write path (segments → manifest →
-    // CURRENT by the standard flush machinery), then close and reopen.
-    {
-        let db = Db::open(config.clone())?;
-        for ops in &batches {
-            db.write(ops)?;
-        }
-        db.flush()?;
-    }
+    // The streaming pass verified every frame against the live destination;
+    // pin the flush/reopen round-trip: the reopened state must fingerprint
+    // identically, and its live-key count is the report cell.
+    db.flush()?;
+    let before = fingerprint(&db)?;
+    drop(db);
     let db = Db::open(config.clone())?;
-    for (key, want) in &expected {
-        let got = db.get(key)?;
-        if got.as_deref() != want.as_deref() {
-            return Err(FormatError::Corrupt(format!(
-                "migration verification failed for key {}: expected {want:?}, got {got:?}",
-                String::from_utf8_lossy(key)
-            )));
-        }
+    let after = fingerprint(&db)?;
+    if before != after {
+        return Err(FormatError::Corrupt(format!(
+            "flush/reopen changed the migrated state ({} live keys -> {})",
+            before.0, after.0
+        )));
     }
 
     Ok(MigrationReport {
-        batches: batches.len() as u64,
+        batches,
         puts,
         deletes,
-        keys: expected.len() as u64,
+        keys: after.0,
         torn_tail_dropped,
         source: source.to_path_buf(),
         dest_dir: config.dir.clone(),

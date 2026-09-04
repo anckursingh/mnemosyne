@@ -65,7 +65,9 @@ fn migrate_v1_wal_moves_state_and_never_deletes_source() {
     assert_eq!(report.batches, 3);
     assert_eq!(report.puts, 5);
     assert_eq!(report.deletes, 1);
-    assert_eq!(report.keys, 4);
+    // PR#2 review SE-04: keys = LIVE keys in the final state (k1 was
+    // deleted mid-history), not distinct keys ever written.
+    assert_eq!(report.keys, 3);
     assert!(!report.torn_tail_dropped);
 
     // never delete (or modify) the source — not even before verification
@@ -132,6 +134,80 @@ fn migrate_stops_at_torn_tail() {
         None,
         "the torn batch was never acked"
     );
+}
+
+/// PR#2 review SE-04 — the streaming reader must stay byte-exact when
+/// frames straddle the read-chunk boundary: hand-craft a source WAL larger
+/// than one chunk from many small records (direct file write — no engine,
+/// no fsyncs), migrate, and pin every count and the reopened state.
+#[test]
+fn migrate_streams_frames_across_chunk_boundaries() {
+    const FRAMES: usize = 4000;
+    const V: usize = 2400; // ~2.4 KiB payload per frame -> ~9.6 MiB WAL
+    let src = tmp("migrate-stream");
+    let mut wal = Vec::new();
+    for i in 0..FRAMES {
+        let key = format!("k{i:05}").into_bytes();
+        let value = format!("v{i:05}{}", "y".repeat(V)).into_bytes();
+        // frozen v1 batch codec: [u16 n_puts] puts* [u16 n_dels] dels*
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&key);
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&value);
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        wal.extend_from_slice(&aikoql_storage::envelope::encode_record(
+            aikoql_storage::envelope::TYPE_BATCH,
+            &payload,
+        ));
+    }
+    assert!(
+        wal.len() > 8 * 1024 * 1024,
+        "fixture must exceed one read chunk"
+    );
+    std::fs::write(&src, &wal).unwrap();
+
+    let dest = dir("migrate-stream-dest");
+    let report = migrate_v1_wal(&src, Config::new(dest.clone())).unwrap();
+    assert_eq!(report.batches, FRAMES as u64);
+    assert_eq!(report.puts, FRAMES as u64);
+    assert_eq!(report.deletes, 0);
+    assert_eq!(report.keys, FRAMES as u64);
+    assert!(!report.torn_tail_dropped);
+
+    let db = Db::open(Config::new(dest)).unwrap();
+    assert_eq!(
+        db.get(b"k00000").unwrap(),
+        Some(format!("v00000{}", "y".repeat(V)).into_bytes())
+    );
+    let last = format!("k{:05}", FRAMES - 1).into_bytes();
+    assert_eq!(
+        db.get(&last).unwrap(),
+        Some(format!("v{:05}{}", FRAMES - 1, "y".repeat(V)).into_bytes())
+    );
+    assert_eq!(db.scan(b"k").unwrap().len(), FRAMES);
+}
+
+/// PR#2 review SE-04 — a single frame larger than the read chunk exercises
+/// the carry path: the reader must keep appending until the frame completes
+/// instead of treating the partial frame as a torn tail.
+#[test]
+fn migrate_single_frame_larger_than_chunk() {
+    let src = tmp("migrate-oversize");
+    let mut b1 = WriteBatch::new();
+    b1.put(b"big".to_vec(), vec![b'z'; 9 * 1024 * 1024]);
+    write_v1(&src, &[b1]);
+
+    let dest = dir("migrate-oversize-dest");
+    let report = migrate_v1_wal(&src, Config::new(dest.clone())).unwrap();
+    assert_eq!(report.batches, 1);
+    assert_eq!(report.puts, 1);
+    assert_eq!(report.keys, 1);
+    assert!(!report.torn_tail_dropped);
+
+    let db = Db::open(Config::new(dest)).unwrap();
+    assert_eq!(db.get(b"big").unwrap(), Some(vec![b'z'; 9 * 1024 * 1024]));
 }
 
 #[test]
