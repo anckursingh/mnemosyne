@@ -2003,3 +2003,440 @@ fn v2_m26_scan_profile() {
     std::fs::write(dir.join("type-scan-profile.md"), report).unwrap();
     cleanup_dataset(&path);
 }
+
+// ---------------------------------------------------------------------------
+// SE2-M27 — W7 context-compilation profile. Strict opt-in: `SE2M27_NIGHTLY=1`.
+// Splits one W7 op (get + outbound_edges + 10 target gets + history) into its
+// engine scans, its engine gets, and the kernel decode/authz work, plus the
+// get_many batch shape as the M27 mix question (M25 falsified the batch at
+// F=10 warm — W7's fan-out is 11, the same shape; the batch leg runs TWICE —
+// two batch-vs-loop pairs — because M25's ratios flipped sign run-to-run and
+// one sample in the 0.80–0.90 band is inconclusive), plus a post-thrash
+// matrix-regime re-run (the matrix's W7 starts after W1-W5's traffic, not on
+// a fresh cache like L1-L5). Writes
+// `artifacts/storage-engine-v2/context-profile.md`. Perf numbers are report
+// cells, never asserts. The shape (capture-pinned): every non-hub KO has
+// exactly 10 outbound edges (phase-2 ring); shallow ids carry 2 versions
+// (create + ring update), deep ids (idx < 10_000) carry 10; W7 = 11
+// head_objects (22 engine gets) + 2 prefix scans (relo/ + ko/) + per-row
+// decode + authz. The legs replay the harness's exact W7 draw sequence
+// (Xs(SEED ^ 0x27).below(100_000), uniform with replacement): a stride
+// sample would ride the ring's block locality and understate the miss rate.
+
+const M27_ENV: &str = "SE2M27_NIGHTLY";
+
+/// One W7 op verbatim (w7_context): k.get(id) + outbound_edges(id) + a
+/// k.get per target + history(id) — shape-pinned inside the op.
+fn m27_w7_op(
+    sample: &[(usize, &KOID, Vec<KOID>, usize)],
+    k: &Kernel,
+    rot: &AtomicUsize,
+    ops: usize,
+) {
+    let r = rot.fetch_add(1, Ordering::Relaxed) % ops;
+    let (_idx, id, targets, n_vers) = &sample[r];
+    let _ = k.get(ctx(), id).unwrap();
+    let edges = k.outbound_edges(id, None).unwrap();
+    assert_eq!(edges.len(), targets.len(), "edge shape drifted");
+    for t in targets {
+        let _ = k.get(ctx(), t).unwrap();
+    }
+    let hist = k.history(ctx(), id).unwrap();
+    assert_eq!(hist.len(), *n_vers, "history shape drifted");
+}
+
+#[test]
+fn v2_m27_context_profile() {
+    match std::env::var(M27_ENV) {
+        Err(std::env::VarError::NotPresent) => return,
+        Ok(v) if v == "1" => {}
+        other => panic!("{M27_ENV} strict opt-in: unset or 1, got {other:?}"),
+    }
+    let sz = Size {
+        n: 100_000,
+        deep: 10_000,
+        ops: 20_000,
+        scan_rounds: 10,
+    };
+    let path = tmp("v2-m27");
+    let engine = Arc::new(AikoqlStorageEngineV2::open(&path).unwrap());
+    let clock = Arc::new(ManualClock::new(10_000));
+    let k = Arc::new(Kernel::open(engine.clone(), clock.clone(), SEED).unwrap());
+    let (ids, _deep, _hubs, _commits) = seed_phases(&k, &clock, sz);
+    let stats = || engine.read_path_stats().unwrap();
+    // the harness W7 leg runs sz.ops/4 = 5000 ops, rng-uniform over the ids
+    const OPS: usize = 5000;
+
+    // uncounted capture — pins the shape the legs assume. The harness's W7
+    // leg draws `rng.below(ids.len())` from a fresh Xs(SEED ^ 0x27) — replay
+    // the exact 5000-draw sequence so the legs reproduce the matrix's access
+    // pattern (uniform WITH replacement, hubs included, no ring-adjacent
+    // block locality — a stride sample would ride the ring and understate
+    // the matrix's miss rate). Every id carries its ring edges (10; 100/1000
+    // for a hub draw) and 10 versions for deep ids (idx < 10_000) or 2 for
+    // shallow (create + ring update); hubs ids[11]/[12] add one more.
+    let mut rng = Xs(SEED ^ 0x27);
+    let sample: Vec<(usize, &KOID, Vec<KOID>, usize)> = (0..OPS)
+        .map(|_| {
+            let idx = rng.below(ids.len());
+            let id = &ids[idx];
+            let edges = k.outbound_edges(id, None).unwrap();
+            assert!(matches!(edges.len(), 10 | 100 | 1000), "edge shape drifted");
+            let n_vers = k.history(ctx(), id).unwrap().len();
+            let expect = match idx {
+                11 | 12 => DEEP_VERSIONS + 1, // deep + the hub restatement
+                _ if idx < sz.deep => DEEP_VERSIONS,
+                _ => 2,
+            };
+            assert_eq!(n_vers, expect, "version shape drifted");
+            (idx, id, edges.iter().map(|(_, t)| *t).collect(), n_vers)
+        })
+        .collect();
+    assert_eq!(sample.len(), OPS, "draw replay drifted");
+    // the op's engine gets: head + version row for the id and each of its
+    // targets (22 lookups per regular op — a hub draw adds 2 per extra edge)
+    let expect_lookups = sample
+        .iter()
+        .map(|(_, _, t, _)| 2 + 2 * t.len())
+        .sum::<usize>() as u64;
+
+    let rot = AtomicUsize::new(0);
+    let mut legs: Vec<ProbeLeg> = Vec::new();
+
+    // L1 — the W7 matrix op (w7_context, the harness shape verbatim) over
+    // the replayed draw sequence: k.get + outbound_edges + per-target
+    // k.get + k.history
+    legs.push(probe_leg(
+        stats,
+        "W7 kernel op — matrix draw replay".into(),
+        OPS,
+        || m27_w7_op(&sample, &k, &rot, OPS),
+    ));
+
+    // L2 — the engine prefix scans alone (relo/<id>/ = the 10 edge rows,
+    // ko/<id> = the version rows): the raw scan floor — the kernel's
+    // scan-side decode is NOT in this leg, it lands in the residual
+    legs.push(probe_leg(
+        stats,
+        "engine scans — relo/<id>/ + ko/<id>".into(),
+        OPS,
+        || {
+            let r = rot.fetch_add(1, Ordering::Relaxed) % OPS;
+            let (_idx, id, targets, n_vers) = &sample[r];
+            let mut relo = Vec::with_capacity(3 + 16 + 1);
+            relo.extend_from_slice(b"relo/");
+            relo.extend_from_slice(id.as_bytes());
+            relo.push(b'/');
+            let rows = engine.scan(&relo).unwrap();
+            assert_eq!(rows.len(), targets.len(), "relo scan shape drifted");
+            let mut ko = Vec::with_capacity(3 + 16);
+            ko.extend_from_slice(b"ko/");
+            ko.extend_from_slice(id.as_bytes());
+            let rows = engine.scan(&ko).unwrap();
+            assert_eq!(rows.len(), *n_vers, "ko scan shape drifted");
+        },
+    ));
+
+    // L3 — the gets only (the harness per-target loop shape): splits the
+    // per-get kernel cost for the per-get check
+    legs.push(probe_leg(
+        stats,
+        "kernel gets — id + per-target loop".into(),
+        OPS,
+        || {
+            let r = rot.fetch_add(1, Ordering::Relaxed) % OPS;
+            let (_idx, id, targets, _n_vers) = &sample[r];
+            let _ = k.get(ctx(), id).unwrap();
+            for t in targets {
+                let _ = k.get(ctx(), t).unwrap();
+            }
+        },
+    ));
+
+    // L4 — the M27 mix question: the same gets through one get_many batch
+    // (M25 falsified the batch at F=10 warm repeated targets; W7's fan-out
+    // is 11 — the same shape)
+    legs.push(probe_leg(
+        stats,
+        "kernel get_many — [id] + targets in one batch".into(),
+        OPS,
+        || {
+            let r = rot.fetch_add(1, Ordering::Relaxed) % OPS;
+            let (_idx, id, targets, _n_vers) = &sample[r];
+            let mut batch = Vec::with_capacity(1 + targets.len());
+            batch.push(**id);
+            batch.extend_from_slice(targets);
+            let _ = k.get_many(ctx(), &batch).unwrap();
+        },
+    ));
+
+    // L5 — history alone: the one new sub-shape vs W4 (one ko/ scan +
+    // decode_ko_wire + authz per version — no gets)
+    legs.push(probe_leg(
+        stats,
+        "kernel history — ko/ scan + per-version decode".into(),
+        OPS,
+        || {
+            let r = rot.fetch_add(1, Ordering::Relaxed) % OPS;
+            let (_idx, id, _targets, n_vers) = &sample[r];
+            let hist = k.history(ctx(), id).unwrap();
+            assert_eq!(hist.len(), *n_vers, "history shape drifted");
+        },
+    ));
+
+    // L7/L8 — the tree's re-run prescription: a second batch-vs-loop pair
+    // over the same replayed sequence (M25's ratios flipped sign run-to-run;
+    // one sample in the 0.80–0.90 band is inconclusive)
+    legs.push(probe_leg(
+        stats,
+        "kernel gets — id + per-target loop (rerun)".into(),
+        OPS,
+        || {
+            let r = rot.fetch_add(1, Ordering::Relaxed) % OPS;
+            let (_idx, id, targets, _n_vers) = &sample[r];
+            let _ = k.get(ctx(), id).unwrap();
+            for t in targets {
+                let _ = k.get(ctx(), t).unwrap();
+            }
+        },
+    ));
+    legs.push(probe_leg(
+        stats,
+        "kernel get_many — [id] + targets in one batch (rerun)".into(),
+        OPS,
+        || {
+            let r = rot.fetch_add(1, Ordering::Relaxed) % OPS;
+            let (_idx, id, targets, _n_vers) = &sample[r];
+            let mut batch = Vec::with_capacity(1 + targets.len());
+            batch.push(**id);
+            batch.extend_from_slice(targets);
+            let _ = k.get_many(ctx(), &batch).unwrap();
+        },
+    ));
+
+    // matrix-regime thrash (uncounted): the harness runs W1-W5 before W7 —
+    // 40k gets, 20k histories over the deep ids (~280 MiB through the 8 MiB
+    // block cache) and 1000 type scans — so the matrix's W7 starts with a
+    // thrashed cache. L1-L5 above are the warm ceiling (fresh cache); L6
+    // re-runs the op after the same thrash.
+    for i in (0..sz.n).step_by(5) {
+        let _ = k.get(ctx(), &ids[i]).unwrap();
+    }
+    for id in &ids[..sz.deep] {
+        let _ = k.history(ctx(), id).unwrap();
+    }
+    for t in 0..100 {
+        let _ = k.scan_by_type(&alice(), &format!("m7_{t}")).unwrap();
+    }
+    legs.push(probe_leg(
+        stats,
+        "W7 kernel op — matrix regime (post-thrash)".into(),
+        OPS,
+        || m27_w7_op(&sample, &k, &rot, OPS),
+    ));
+
+    // mechanism pins — the op = 11 head_objects × 2 engine gets; scans and
+    // history do not count lookups
+    assert_eq!(
+        legs[0].d.lookups, expect_lookups,
+        "W7 op = 2 engine gets per head_object"
+    );
+    assert_eq!(legs[1].d.lookups, 0, "engine scans do not count lookups");
+    assert_eq!(
+        legs[2].d.lookups, expect_lookups,
+        "get leg = 2 engine gets per head_object"
+    );
+    assert_eq!(
+        legs[3].d.lookups, expect_lookups,
+        "get_many = 2 engine gets per head_object"
+    );
+    assert_eq!(legs[4].d.lookups, 0, "history does not count lookups");
+    assert_eq!(
+        legs[5].d.lookups, expect_lookups,
+        "loop rerun = 2 engine gets per head_object"
+    );
+    assert_eq!(
+        legs[6].d.lookups, expect_lookups,
+        "batch rerun = 2 engine gets per head_object"
+    );
+    assert_eq!(
+        legs[7].d.lookups, expect_lookups,
+        "post-thrash W7 op = 2 engine gets per head_object"
+    );
+
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../artifacts/storage-engine-v2");
+    std::fs::create_dir_all(&dir).unwrap();
+    let machine = format!(
+        "{}/{}; {} logical cores; {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0),
+        std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "processor NOT_REPORTED".into()),
+    );
+    let n_deep = sample
+        .iter()
+        .filter(|(idx, _, _, _)| *idx < sz.deep)
+        .count();
+    let n_shallow = OPS - n_deep;
+    let mut report = format!(
+        "# Context Compilation Profile (W7) — SE2-M27\n\n\
+         Generated only when `{M27_ENV}=1` (strict opt-in). Perf numbers are report cells, never asserts.\n\n\
+         - Test: `v2_m27_context_profile`\n\
+         - Build mode: {}\n\
+         - Machine: {machine}\n\
+         - Date: {}\n\
+         - Dataset: one v2 database, {} KOs / {} deep × {DEEP_VERSIONS} versions (SEED {SEED:#x}); one W7 op = `k.get(id)` (2 engine point gets — head + ~1.4 KiB version row — + decode + authz) + `outbound_edges(id)` (one `relo/` prefix scan, no gets, no authz) + 10 × `k.get(target)` + `history(id)` (one `ko/` prefix scan + decode + authz per version, no gets)\n\
+         - Sample (capture-pinned): the harness's exact W7 draw sequence — {OPS} draws of `Xs(SEED ^ 0x27).below(100000)`, uniform with replacement (a stride sample would ride the ring's block locality and understate the miss rate); hubs included when drawn (100/1000 edges, 11 versions); {} deep draws × 10 versions + {} shallow × 2 (create + ring update)\n\
+         - Matrix reference (09-05 workloads.md, warm): W7 v2 222 µs vs v1 57 µs (3.9× — inside the amended gate-5 bound ≤8×); L1/L6 below run the same op on this machine in two cache regimes (fresh vs post-W1-W5-thrash)\n\
+         - Decision-tree thresholds (fixed before the run): scan share < 15% → no scan-shape work (the scans are already single prefix scans); kernel residual > 30% → kernel-side profiling follow-up; batch ratio ≥ 0.90 → parity (M25's falsification holds at W7's mix → no new batch primitives); < 0.80 → reopen the batch question; 0.80–0.90 → re-run before deciding (built in — two batch-vs-loop pairs per run); history share > 30% → the versions path gets its own follow-up\n\n",
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+        run_date(),
+        sz.n,
+        sz.deep,
+        n_deep,
+        n_shallow,
+    );
+    report.push_str("| leg | p50 | p95 | p99 | max | throughput |\n|---|---|---|---|---|---|\n");
+    for l in &legs {
+        report.push_str(&format!(
+            "| {} | {:.0} µs | {:.0} µs | {:.0} µs | {:.0} µs | {:.0} ops/s (mean {:.0} µs) |\n",
+            l.label,
+            l.p50 as f64 / 1000.0,
+            l.p95 as f64 / 1000.0,
+            l.p99 as f64 / 1000.0,
+            l.wall_max as f64 / 1000.0,
+            l.ops as f64 / (l.wall_ms / 1000.0),
+            l.wall_ms * 1000.0 / l.ops as f64,
+        ));
+    }
+    report.push_str(
+        "\n| leg | lookups/op | cache hits/op | cache misses/op | blocks read/op | bytes read/op | entries decoded/op | get_wall/op | segs/op |\n|---|---|---|---|---|---|---|---|---|\n",
+    );
+    for l in &legs {
+        report.push_str(&format!(
+            "| {} | {:.0} | {:.1} | {:.1} | {:.1} | {:.0} | {:.0} | {:.0} µs | {:.1} |\n",
+            l.label,
+            l.d.lookups as f64 / l.ops as f64,
+            l.d.block_cache_hits as f64 / l.ops as f64,
+            l.d.block_cache_misses as f64 / l.ops as f64,
+            l.d.blocks_read as f64 / l.ops as f64,
+            l.d.bytes_read as f64 / l.ops as f64,
+            l.d.entries_decoded as f64 / l.ops as f64,
+            l.d.get_wall_ns as f64 / l.ops as f64 / 1000.0,
+            l.d.segments_considered as f64 / l.ops as f64,
+        ));
+    }
+    // decomposition — sums over the legs, honestly labeled (kernel work
+    // interleaves with engine waits, so the residual is the subtraction
+    // bound, M21-style)
+    let l1 = &legs[0];
+    let l2 = &legs[1];
+    let l3 = &legs[2];
+    let l4 = &legs[3];
+    let l5 = &legs[4];
+    let l7 = &legs[5];
+    let l8 = &legs[6];
+    let l6 = &legs[7];
+    let w1 = l1.wall_ms * 1000.0; // µs over the leg
+    let w2 = l2.wall_ms * 1000.0;
+    let w3 = l3.wall_ms * 1000.0;
+    let w5 = l5.wall_ms * 1000.0;
+    let gw1 = l1.d.get_wall_ns as f64 / 1000.0; // engine get_wall, µs over the leg
+    let gw3 = l3.d.get_wall_ns as f64 / 1000.0;
+    let gw4 = l4.d.get_wall_ns as f64 / 1000.0;
+    let gets = l1.ops as f64 * 11.0; // 11 head_objects per op
+    let scan_share = w2 / w1;
+    let get_share = gw1 / w1;
+    let kernel_per_op = (w1 - w2 - gw1) / l1.ops as f64; // µs
+    let kernel_share = kernel_per_op / (w1 / l1.ops as f64);
+    let res_per_get_l1 = (w1 - w2 - gw1) / gets; // µs — kernel work per get in the op
+    let res_per_get_l3 = (w3 - gw3) / gets; // µs
+    let batch_ratio = l4.p50 as f64 / l3.p50 as f64;
+    let batch_ratio2 = l8.p50 as f64 / l7.p50 as f64;
+    let history_share = w5 / w1;
+    let repro = (l1.p50 as f64 / 1000.0 - 222.0) / 222.0 * 100.0;
+    let row_line = if res_per_get_l3 > 0.01 {
+        format!(
+            "{:.1} µs per get in the W7 op vs {:.1} µs per plain get in leg 3 ({:+.1}% per get beyond a plain get)",
+            res_per_get_l1,
+            res_per_get_l3,
+            (res_per_get_l1 / res_per_get_l3 - 1.0) * 100.0,
+        )
+    } else {
+        format!(
+            "{:.1} µs per get in the W7 op; leg 3's per-get kernel work ≈ 0 (engine-bound gets)",
+            res_per_get_l1,
+        )
+    };
+    report.push_str(&format!(
+        "\n## Decomposition (sums over the legs)\n\n\
+         - engine scans: {:.0} µs of the {:.0} µs mean W7 op ({:.1}%) — leg 2 runs both prefix scans on the same rotation (relo → 10 edge rows, ko → 2–10 version rows); the kernel's scan-side decode is NOT in leg 2, it lands in the residual\n\
+         - engine point gets: {:.0} µs/op ({:.1}%) — get_wall accumulated by the 11 head_objects (22 engine gets per op)\n\
+         - kernel residual: {:.0} µs/op ({:.1}%) = W7 wall − scans − engine gets (decode + authz + assembly)\n\
+         - per-get kernel check: {row_line}\n\
+         - history share: {:.0} µs/op ({:.1}% of the W7 op) — one ko/ prefix scan + decode + authz per version, zero lookups (its engine floor is part of leg 2)\n\
+         - batch shape: get_many p50 {:.0} µs vs per-target loop p50 {:.0} µs ({:.2}×) — rerun {:.0} µs vs {:.0} µs ({:.2}×); engine get_wall inside the batch {:.0} µs/op vs the loop {:.0} µs/op; segs/op loop {:.0} vs batch {:.0} (the batch resolves the segment list once, the loop re-walks it per get — M25's warm repeated-target shape hid this cost)\n\
+         - matrix reproduction: L1 p50 {:.0} µs vs the 09-05 cell 222 µs ({:+.1}%) — the harness's exact draw sequence; L6 (post-thrash) {:.0} µs\n\
+         - regime: L6 re-runs the op after W1/W3/W5-shaped thrash (20k gets + 10k histories + 100 type scans ≈ 420 MiB through the 8 MiB block cache) and moves nothing — with the matrix's random draws each op's rows are scattered, so the block cache barely matters either way; any remaining gap vs the cell is sampling-independent (the matrix's 15+ min of sustained-load CPU state, OS page-cache differences)\n\n",
+        w2 / l2.ops as f64,
+        w1 / l1.ops as f64,
+        scan_share * 100.0,
+        gw1 / l1.ops as f64,
+        get_share * 100.0,
+        kernel_per_op,
+        kernel_share * 100.0,
+        w5 / l5.ops as f64,
+        history_share * 100.0,
+        l4.p50 as f64 / 1000.0,
+        l3.p50 as f64 / 1000.0,
+        batch_ratio,
+        l8.p50 as f64 / 1000.0,
+        l7.p50 as f64 / 1000.0,
+        batch_ratio2,
+        gw4 / l4.ops as f64,
+        gw3 / l3.ops as f64,
+        l3.d.segments_considered as f64 / l3.ops as f64,
+        l4.d.segments_considered as f64 / l4.ops as f64,
+        l1.p50 as f64 / 1000.0,
+        repro,
+        l6.p50 as f64 / 1000.0,
+    ));
+    // the decision tree, computed against the pre-fixed thresholds
+    let scan_verdict = if scan_share < 0.15 {
+        "no scan-shape work — W7 is get-bound; both scans are already single prefix scans"
+    } else if scan_share < 0.40 {
+        "block-summary investigation opens — the scans' own share is material"
+    } else {
+        "scan-shape work — the scans dominate the op"
+    };
+    let kernel_verdict = if kernel_share > 0.30 {
+        "kernel-side profiling follow-up — decode/authz/assembly is >30% of the op"
+    } else {
+        "no kernel instrumentation"
+    };
+    let batch_verdict = if batch_ratio >= 0.90 && batch_ratio2 >= 0.90 {
+        "the W7 mix does NOT differ from M25's falsified shape — get_many is parity-or-worse inside W7 in both runs, so no versions_many/relationships_many primitives: history and outbound_edges are already ONE prefix scan each (their cost is per-row decode, not fetch) and the target gets are the only batchable sub-shape, falsified by M25 and these legs — M27 closes as a skip"
+    } else if batch_ratio < 0.80 && batch_ratio2 < 0.80 {
+        "the batch wins inside W7 in both runs — the mix differs from M25's shape; the batch question reopens"
+    } else {
+        "inconclusive band (0.80–0.90) — the runs straddle or sit inside it; re-run the probe before deciding"
+    };
+    let history_verdict = if history_share > 0.30 {
+        "the versions path gets its own follow-up milestone"
+    } else {
+        "no versions-path work — history's share is small"
+    };
+    report.push_str(&format!(
+        "\n## Verdict\n\n- scan share {:.1}%: {scan_verdict}.\n- kernel residual {:.1}%: {kernel_verdict}.\n- batch ratios {:.2}× / {:.2}×: {batch_verdict}.\n- history share {:.1}%: {history_verdict}.\n",
+        scan_share * 100.0,
+        kernel_share * 100.0,
+        batch_ratio,
+        batch_ratio2,
+        history_share * 100.0,
+    ));
+    std::fs::write(dir.join("context-profile.md"), report).unwrap();
+    cleanup_dataset(&path);
+}
