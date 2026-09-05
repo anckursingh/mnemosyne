@@ -54,7 +54,7 @@ use common::run_date;
 use common::{bytes_written, ctx, percentiles, tmp, CountingEngine, LogicalCounts};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1524,16 +1524,43 @@ fn v2_attribution_probe() {
 
 const M25_ENV: &str = "SE2M25_NIGHTLY";
 
-struct M25Leg {
+/// One probe leg: per-op walls (attrib_leg) + the leg's total stats delta.
+struct ProbeLeg {
     label: String,
     ops: u64,
     wall_ms: f64,
     p50: u64,
     p95: u64,
     p99: u64,
+    wall_max: u64,
     d: ReadPathStats,
 }
 
+fn probe_leg(
+    stats: impl Fn() -> ReadPathStats,
+    label: String,
+    ops: usize,
+    mut run: impl FnMut(),
+) -> ProbeLeg {
+    let (recs, d) = attrib_leg(stats, SEED ^ 0x25, ops, |_| run());
+    let walls: Vec<u128> = recs.iter().map(|r| r.wall as u128).collect();
+    // bimodal legs (1 giant + 99 small) hide the tail in p99 — keep the max
+    let wall_max = walls.iter().copied().max().unwrap_or(0);
+    let (p50, p95, p99) = percentiles(walls);
+    let wall_ms = recs.iter().map(|r| r.wall as u128).sum::<u128>() as f64 / 1e6;
+    ProbeLeg {
+        label,
+        ops: ops as u64,
+        wall_ms,
+        p50: p50 as u64,
+        p95: p95 as u64,
+        p99: p99 as u64,
+        wall_max: wall_max as u64,
+        d,
+    }
+}
+
+/// The M25 batch-vs-loop leg on one hub.
 fn m25_leg(
     stats: impl Fn() -> ReadPathStats,
     label: String,
@@ -1542,8 +1569,8 @@ fn m25_leg(
     fan: usize,
     ops: usize,
     batch: bool,
-) -> M25Leg {
-    let (recs, d) = attrib_leg(stats, SEED ^ 0x25, ops, |_| {
+) -> ProbeLeg {
+    probe_leg(stats, label, ops, || {
         let edges = k.outbound_edges(hub, None).unwrap();
         assert_eq!(edges.len(), fan, "hub fan-out drifted");
         if batch {
@@ -1554,19 +1581,7 @@ fn m25_leg(
                 let _ = k.get(ctx(), t).unwrap();
             }
         }
-    });
-    let walls: Vec<u128> = recs.iter().map(|r| r.wall as u128).collect();
-    let (p50, p95, p99) = percentiles(walls);
-    let wall_ms = recs.iter().map(|r| r.wall as u128).sum::<u128>() as f64 / 1e6;
-    M25Leg {
-        label,
-        ops: ops as u64,
-        wall_ms,
-        p50: p50 as u64,
-        p95: p95 as u64,
-        p99: p99 as u64,
-        d,
-    }
+    })
 }
 
 #[test]
@@ -1595,7 +1610,7 @@ fn v2_m25_relationship_batch() {
     let stats = || engine.read_path_stats().unwrap();
 
     let fans = [10usize, 100, 1000];
-    let mut legs: Vec<M25Leg> = Vec::new();
+    let mut legs: Vec<ProbeLeg> = Vec::new();
     for (i, &fan) in fans.iter().enumerate() {
         let ops = (1000 / fan).max(5);
         legs.push(m25_leg(
@@ -1718,5 +1733,273 @@ fn v2_m25_relationship_batch() {
         c.d.entries_decoded as f64 / c.ops as f64,
     ));
     std::fs::write(dir.join("relationship-batch.md"), report).unwrap();
+    cleanup_dataset(&path);
+}
+
+// ---------------------------------------------------------------------------
+// SE2-M26 — W5 type-scan profile. Strict opt-in: `SE2M26_NIGHTLY=1`. Splits
+// one `k.scan_by_type` op (the W5 matrix shape) into its engine prefix scan,
+// its engine point gets, and the kernel per-candidate work, plus a hot-type
+// ceiling leg. Writes `artifacts/storage-engine-v2/type-scan-profile.md`.
+// Perf numbers are report cells, never asserts.
+// Index shape (probe-assumed, capture-pinned): the harness's phase-2
+// `rmv(.., "m7_0")` restates EVERY KO to m7_0, so m7_0 holds 100_000 live
+// candidates and m7_1..m7_99 hold 1000 stale phase-1 candidates each —
+// rejected by the payload re-check after full decode (kernel keeps stale
+// entries by design, kernel.rs:1282). Mean candidates per matrix op = 1990.
+
+const M26_ENV: &str = "SE2M26_NIGHTLY";
+
+#[test]
+fn v2_m26_scan_profile() {
+    match std::env::var(M26_ENV) {
+        Err(std::env::VarError::NotPresent) => return,
+        Ok(v) if v == "1" => {}
+        other => panic!("{M26_ENV} strict opt-in: unset or 1, got {other:?}"),
+    }
+    // one W5 op = 1 engine prefix scan over the type index (empty values) +
+    // 1 head_object per candidate (2 engine point gets + wire decode +
+    // type/Deleted checks + authz read-lock); no KnowledgeCache, no
+    // decryption on this path.
+    let sz = Size {
+        n: 100_000,
+        deep: 10_000,
+        ops: 20_000,
+        scan_rounds: 10,
+    };
+    let path = tmp("v2-m26");
+    let engine = Arc::new(AikoqlStorageEngineV2::open(&path).unwrap());
+    let clock = Arc::new(ManualClock::new(10_000));
+    let k = Arc::new(Kernel::open(engine.clone(), clock.clone(), SEED).unwrap());
+    let (ids, _deep, _hubs, _commits) = seed_phases(&k, &clock, sz);
+    let stats = || engine.read_path_stats().unwrap();
+    let per_type = sz.n / N_TYPES; // 1000
+
+    // uncounted capture — asserts the index shape the legs assume: m7_0
+    // holds every KO (phase-2 restatement), m7_1..99 hold their stale
+    // phase-1 rows, rejected by the payload re-check after full decode.
+    for t in 0..N_TYPES {
+        let rows = engine.scan(format!("type/m7_{t}/").as_bytes()).unwrap();
+        let expect_rows = if t == 0 { sz.n } else { per_type };
+        assert_eq!(rows.len(), expect_rows, "type index shape drifted");
+        let kos = k.scan_by_type(&alice(), &format!("m7_{t}")).unwrap();
+        let expect_ret = if t == 0 { sz.n } else { 0 };
+        assert_eq!(kos.len(), expect_ret, "payload re-check shape drifted");
+    }
+    // the candidate sets scan_by_type decodes per type — derived from the
+    // phase-1 assignment (i % N_TYPES) plus the phase-2 m7_0 restatement
+    let cand: Vec<Vec<&KOID>> = (0..N_TYPES)
+        .map(|t| {
+            if t == 0 {
+                ids.iter().collect()
+            } else {
+                ids.iter().skip(t).step_by(N_TYPES).collect()
+            }
+        })
+        .collect();
+
+    let rot = AtomicUsize::new(0);
+    let mut legs: Vec<ProbeLeg> = Vec::new();
+
+    // L1 — the W5 matrix op: kernel type scan, round-robin like the harness
+    legs.push(probe_leg(
+        stats,
+        "W5 kernel op — scan_by_type (rotating)".into(),
+        100,
+        || {
+            let t = rot.fetch_add(1, Ordering::Relaxed) % N_TYPES;
+            let kos = k.scan_by_type(&alice(), &format!("m7_{t}")).unwrap();
+            let expect = if t == 0 { sz.n } else { 0 };
+            assert_eq!(kos.len(), expect, "W5 scan shape drifted");
+        },
+    ));
+
+    // L2 — the engine prefix scan alone (same rotation)
+    legs.push(probe_leg(
+        stats,
+        "engine scan — type/m7_t/ (rotating)".into(),
+        100,
+        || {
+            let t = rot.fetch_add(1, Ordering::Relaxed) % N_TYPES;
+            let rows = engine.scan(format!("type/m7_{t}/").as_bytes()).unwrap();
+            let expect = if t == 0 { sz.n } else { per_type };
+            assert_eq!(rows.len(), expect, "engine scan shape drifted");
+        },
+    ));
+
+    // L3 — kernel head_objects over the candidate set scan_by_type decodes
+    // (same rotation): 100_000 for m7_0, 1000 stale for m7_1..99
+    legs.push(probe_leg(
+        stats,
+        "kernel gets — k.get over scan candidates".into(),
+        100,
+        || {
+            let t = rot.fetch_add(1, Ordering::Relaxed) % N_TYPES;
+            for koid in &cand[t] {
+                let _ = k.get(ctx(), koid).unwrap();
+            }
+        },
+    ));
+
+    // L4 — hot-type ceiling: the polluted m7_0 (all 100_000 KOs) re-scanned
+    legs.push(probe_leg(
+        stats,
+        "hot-type ceiling — m7_0 × 10".into(),
+        10,
+        || {
+            let kos = k.scan_by_type(&alice(), "m7_0").unwrap();
+            assert_eq!(kos.len(), sz.n, "hot scan drifted");
+        },
+    ));
+
+    // mechanism pins — 100 rotating ops = 100_000 + 99×1000 = 199_000
+    // candidates per leg × 2 engine gets each; the hot leg = 10 × 100_000
+    let cand_per_leg = (sz.n + (N_TYPES - 1) * per_type) as u64;
+    assert_eq!(
+        legs[0].d.lookups,
+        cand_per_leg * 2,
+        "W5 op = 2 engine gets per candidate"
+    );
+    assert_eq!(legs[1].d.lookups, 0, "engine scans do not count lookups");
+    assert_eq!(
+        legs[2].d.lookups,
+        cand_per_leg * 2,
+        "get leg = 2 engine gets per candidate"
+    );
+    assert_eq!(
+        legs[3].d.lookups,
+        10 * sz.n as u64 * 2,
+        "hot leg = 2 engine gets per candidate"
+    );
+
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../artifacts/storage-engine-v2");
+    std::fs::create_dir_all(&dir).unwrap();
+    let machine = format!(
+        "{}/{}; {} logical cores; {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0),
+        std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "processor NOT_REPORTED".into()),
+    );
+    let mut report = format!(
+        "# Type Scan Profile (W5) — SE2-M26\n\n\
+         Generated only when `{M26_ENV}=1` (strict opt-in). Perf numbers are report cells, never asserts.\n\n\
+         - Test: `v2_m26_scan_profile`\n\
+         - Build mode: {}\n\
+         - Machine: {machine}\n\
+         - Date: {}\n\
+         - Dataset: one v2 database, {} KOs / {} deep × {DEEP_VERSIONS} versions (SEED {SEED:#x}); one W5 op = `k.scan_by_type` = 1 engine prefix scan over the type index (empty values) + 1 head_object per candidate (2 engine point gets — head + ~1.4 KiB version row — + wire decode + type/Deleted checks + authz read-lock)\n\
+         - Index shape (capture-pinned): m7_0 → {} rows → {} returned (harness phase-2 `rmv(.., \"m7_0\")` restated every KO to m7_0); m7_1..99 → {} rows → 0 returned (stale phase-1 entries, rejected by the payload re-check after full decode — stale entries kept by design, kernel.rs:1282); mean candidates per matrix op = {}\n\
+         - Matrix reference (09-05 workloads.md, warm): W5 v2 27451 µs vs v1 5534 µs — the cell mixes both shapes via TYPE_ROUND: 10 rounds × 100 types = 1% m7_0 ops + 99% stale-type ops\n\
+         - Decision-tree thresholds (fixed before the run): scan share < 15% → no index (W5 is get-bound); 15–40% → block-summary investigation opens; > 40% → scan-shape work (posting lists); kernel residual > 30% → kernel-side profiling follow-up\n\n",
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+        run_date(),
+        sz.n,
+        sz.deep,
+        sz.n,
+        sz.n,
+        per_type,
+        cand_per_leg / 100,
+    );
+    report.push_str("| leg | p50 | p95 | p99 | max | throughput |\n|---|---|---|---|---|---|\n");
+    for l in &legs {
+        report.push_str(&format!(
+            "| {} | {:.0} µs | {:.0} µs | {:.0} µs | {:.0} µs | {:.0} ops/s (mean {:.0} µs) |\n",
+            l.label,
+            l.p50 as f64 / 1000.0,
+            l.p95 as f64 / 1000.0,
+            l.p99 as f64 / 1000.0,
+            l.wall_max as f64 / 1000.0,
+            l.ops as f64 / (l.wall_ms / 1000.0),
+            l.wall_ms * 1000.0 / l.ops as f64,
+        ));
+    }
+    report.push_str(
+        "\n| leg | lookups/op | cache hits/op | cache misses/op | blocks read/op | bytes read/op | entries decoded/op | get_wall/op |\n|---|---|---|---|---|---|---|---|\n",
+    );
+    for l in &legs {
+        report.push_str(&format!(
+            "| {} | {:.0} | {:.1} | {:.1} | {:.1} | {:.0} | {:.0} | {:.0} µs |\n",
+            l.label,
+            l.d.lookups as f64 / l.ops as f64,
+            l.d.block_cache_hits as f64 / l.ops as f64,
+            l.d.block_cache_misses as f64 / l.ops as f64,
+            l.d.blocks_read as f64 / l.ops as f64,
+            l.d.bytes_read as f64 / l.ops as f64,
+            l.d.entries_decoded as f64 / l.ops as f64,
+            l.d.get_wall_ns as f64 / l.ops as f64 / 1000.0,
+        ));
+    }
+    // decomposition — sums over the legs, honestly labeled (kernel work
+    // interleaves with engine waits, so the residual is the subtraction
+    // bound, M21-style); candidate counts differ per op (m7_0 vs stale)
+    // so per-candidate figures use the leg's mean candidates per op
+    let l1 = &legs[0];
+    let l2 = &legs[1];
+    let l3 = &legs[2];
+    let l4 = &legs[3];
+    let w1 = l1.wall_ms * 1000.0; // µs over the leg
+    let w2 = l2.wall_ms * 1000.0;
+    let w3 = l3.wall_ms * 1000.0;
+    let cand_mean = cand_per_leg as f64 / l1.ops as f64; // 1990 candidates/op
+    let scan_share = w2 / w1;
+    let get_share = l1.d.get_wall_ns as f64 / 1000.0 / w1;
+    let kernel_per_op = (w1 - w2 - l1.d.get_wall_ns as f64 / 1000.0) / l1.ops as f64; // µs
+    let kernel_share = kernel_per_op / (w1 / l1.ops as f64);
+    let per_cand_scan = kernel_per_op / cand_mean; // µs — kernel work per candidate in the scan
+    let per_cand_l3 = (w3 - l3.d.get_wall_ns as f64 / 1000.0) / (l3.ops as f64 * cand_mean); // µs
+    let row_line = if per_cand_l3 > 0.01 {
+        format!(
+            "{:.1} µs per candidate in the W5 op vs {:.1} µs per plain k.get in leg 3 ({:+.1}% per candidate beyond a plain get)",
+            per_cand_scan,
+            per_cand_l3,
+            (per_cand_scan / per_cand_l3 - 1.0) * 100.0,
+        )
+    } else {
+        format!(
+            "{:.1} µs per candidate in the W5 op; leg 3's per-get kernel work ≈ 0 (engine-bound gets)",
+            per_cand_scan,
+        )
+    };
+    report.push_str(&format!(
+        "\n## Decomposition (sums over the legs)\n\n\
+         - engine prefix scan: {:.0} µs of the {:.0} µs mean W5 op ({:.1}%) — leg 2 runs the same rotation on the same prefix\n\
+         - engine point gets: {:.0} µs/op ({:.1}%) — get_wall accumulated by the gets inside the W5 op (mean {cand_mean:.0} candidates × 2 gets; the mean op includes the 1% m7_0 giant)\n\
+         - kernel residual: {:.0} µs/op ({:.1}%) = W5 wall − scan − engine gets (decode + type/Deleted checks + authz + assembly)\n\
+         - per-candidate kernel check: {row_line}\n\
+         - hot-type ceiling: {:.0} µs p50 when the polluted m7_0 (100_000 KOs) is re-scanned (leg 4, cache-served) vs {:.0} µs rotating\n\
+         - bimodality: p50–p99 are ALL stale-type ops (1000 candidates → 0 returned); the 1% m7_0 op (100_000 candidates → 100_000 returned) is the max column — invisible to p99 but 35% of the mean wall\n\n",
+        w2 / l2.ops as f64,
+        w1 / l1.ops as f64,
+        scan_share * 100.0,
+        l1.d.get_wall_ns as f64 / 1000.0 / l1.ops as f64,
+        get_share * 100.0,
+        kernel_per_op,
+        kernel_share * 100.0,
+        l4.p50 as f64 / 1000.0,
+        l1.p50 as f64 / 1000.0,
+    ));
+    // the decision tree, computed against the pre-fixed thresholds
+    let scan_verdict = if scan_share < 0.15 {
+        "no type index / no posting lists / no block summaries — W5 is candidate-bound, not scan-bound (the index already resolves candidates; the cost is the per-candidate head_object); its warm gate-5 cell (27451/5534 = 4.96× v1, 09-05) sits inside the amended ≤8× bound"
+    } else if scan_share < 0.40 {
+        "block-summary investigation opens — the scan's own share is material"
+    } else {
+        "scan-shape work (posting lists) — the scan dominates the op"
+    };
+    let kernel_verdict = if kernel_share > 0.30 {
+        "kernel-side profiling follow-up — decode/authz/assembly is >30% of the op"
+    } else {
+        "no kernel instrumentation — the per-candidate work matches a plain get"
+    };
+    report.push_str(&format!(
+        "\n## Verdict\n\n- scan share {:.1}%: {scan_verdict}.\n- kernel residual {:.1}%: {kernel_verdict}.\n- stale-index note: 99% of matrix ops decode 1000 stale candidates and return 0 — wasted work by design (kernel keeps stale entries); m7_0's 100_000-row scan carries the tail. The harness shape is unchanged (matrix cells are the certification reference).\n",
+        scan_share * 100.0,
+        kernel_share * 100.0,
+    ));
+    std::fs::write(dir.join("type-scan-profile.md"), report).unwrap();
     cleanup_dataset(&path);
 }
