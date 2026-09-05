@@ -70,9 +70,15 @@ const SEED: u64 = 0x27_0000;
 const N_TYPES: usize = 100;
 const DEEP_VERSIONS: usize = 10; // "10+ versions each" (§27 W3)
 /// Gate 5 bound: the KO-lookup rows may be at most this much slower than
-/// the adopted v1 baseline to count as competitive (v1's own gate vs redb
-/// used the same 2× envelope, mirrored here against v1).
-const GATE5_SLOWDOWN_BOUND: f64 = 2.0;
+/// the adopted v1 baseline to count as competitive. The original 2×
+/// envelope (v1's own gate vs redb) was a RAM-vs-RAM bar: v1's mirror
+/// pays zero disk by design, while v2's bounded-RAM contract pays one
+/// warm block read + soft sha256 per miss (the M22 probe measured 18.7 µs
+/// block io inside a 33.5 µs get). SE2-M22 amendment (2026-09-05, user
+/// decision): re-bound to 8×, the bounded-RAM design envelope — ~1.2–1.5×
+/// headroom over the measured 5.6–6.7×; the 2× bar is unreachable without
+/// converging on v1's design (adoption-decision.md, remediation section).
+const GATE5_SLOWDOWN_BOUND: f64 = 8.0;
 
 static TYPE_ROUND: AtomicU64 = AtomicU64::new(0);
 
