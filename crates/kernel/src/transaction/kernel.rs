@@ -2645,6 +2645,37 @@ impl Kernel {
         Ok(ko)
     }
 
+    /// SE2-M25 — batch KO lookups under one auth guard; the same rules as
+    /// per-target `get` (a missing KO fails the whole batch with NotFound,
+    /// per-object field decryption).
+    pub fn get_many(
+        &self,
+        ctx: impl Into<KnowledgeContext>,
+        koids: &[KOID],
+    ) -> KResult<Vec<KnowledgeObject>> {
+        let ctx = ctx.into();
+        let mut kos = self.objects.get_many(koids)?;
+        {
+            let auth = self.auth.read().unwrap();
+            for ko in &kos {
+                auth.authorize(&ctx.subject, ko, Action::Read)?;
+            }
+        }
+        // Field-level decryption (MRFC-0020 Phase 3), one policy lock for
+        // the batch.
+        if let Some(ref fc) = self.field_crypto {
+            let policies = self.encryption_policies.read().unwrap();
+            let tenant = ctx.tenant.as_deref().unwrap_or("default");
+            for ko in &mut kos {
+                if let Some(policy) = policies.get(&ko.metadata.type_name) {
+                    fc.decrypt_fields(tenant, &ko.metadata.type_name, &mut ko.properties, policy)
+                        .map_err(|e| KError::Store(format!("field decrypt: {}", e)))?;
+                }
+            }
+        }
+        Ok(kos)
+    }
+
     pub fn get_at(
         &self,
         ctx: impl Into<KnowledgeContext>,

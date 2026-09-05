@@ -52,6 +52,7 @@ use crate::format::{checksum8, publish_atomic_writer, Cursor, FormatError};
 use crate::stats::Stats;
 use aikoql_kernel::knowledge::kom::sha256;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::ops::Range;
@@ -868,6 +869,52 @@ impl SegmentReader {
             return Ok(None);
         };
         self.block_get(i, key)
+    }
+
+    /// SE2-M25 — batch point lookup, answers parallel to the input (`None` =
+    /// not in this segment). Keys are located once and grouped by block;
+    /// each block is fetched/checksum-validated once, then every key in it
+    /// decodes from the held payload (v2) or is found in the whole-block
+    /// decode (v1) — the same dispatch as `block_get`, with the block I/O
+    /// amortized over the batch.
+    pub fn get_many(&self, keys: &[&[u8]]) -> Result<Vec<Option<SegmentEntry>>, FormatError> {
+        let t0 = self.stats.as_ref().map(|_| Instant::now());
+        let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (pos, key) in keys.iter().enumerate() {
+            if let Some(i) = self.locate(key) {
+                by_block.entry(i).or_default().push(pos);
+            }
+        }
+        if let (Some(st), Some(t0)) = (&self.stats, t0) {
+            st.index_lookup_ns
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        let mut out: Vec<Option<SegmentEntry>> = (0..keys.len()).map(|_| None).collect();
+        for (i, positions) in by_block {
+            let b = &self.data[i];
+            if !b.v2 {
+                let entries = self.block_entries(i)?;
+                for pos in positions {
+                    out[pos] = entries
+                        .iter()
+                        .find(|e| e.key.as_slice() == keys[pos])
+                        .cloned();
+                }
+                continue;
+            }
+            let raw = self.block_raw(i)?;
+            let payload = &raw[BLOCK_HEADER_LEN..];
+            for pos in positions {
+                let t1 = self.stats.as_ref().map(|_| Instant::now());
+                let res = self.block_get_v2(keys[pos], payload)?;
+                if let (Some(st), Some(t1)) = (&self.stats, t1) {
+                    st.block_decode_ns
+                        .fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                out[pos] = res;
+            }
+        }
+        Ok(out)
     }
 
     /// Every version of `key`, seq-descending. Versions may straddle a block

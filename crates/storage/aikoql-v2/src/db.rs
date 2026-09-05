@@ -38,6 +38,7 @@ use crate::segment::{
 use crate::stats::{ReadPathStats, Stats};
 use crate::wal::{encode_frame, replay_frames, Op};
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -475,6 +476,125 @@ impl Db {
             .get_wall_ns
             .fetch_add(t_wall.elapsed().as_nanos() as u64, Ordering::Relaxed);
         out
+    }
+
+    /// SE2-M25 — batch point lookups, answers parallel to the input. Dedups
+    /// the key set (`lookups` counts unique keys — duplicates share one
+    /// lookup; the M21 accounting pins measure `get` only and stay
+    /// untouched), one state guard for the whole batch, one key hash per
+    /// unique key across its segment blooms, and one block fetch per block
+    /// via `SegmentReader::get_many` — the same resolution rules as `get`
+    /// (newest PUT wins, a DELETE shadows everything older).
+    pub fn get_many(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, FormatError> {
+        let t_wall = Instant::now();
+        let out = self.get_many_inner(keys);
+        self.stats
+            .get_wall_ns
+            .fetch_add(t_wall.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        out
+    }
+
+    fn get_many_inner(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, FormatError> {
+        let mut first_pos: HashMap<&[u8], usize> = HashMap::with_capacity(keys.len());
+        let mut unique: Vec<usize> = Vec::with_capacity(keys.len());
+        for (pos, key) in keys.iter().enumerate() {
+            if !first_pos.contains_key(key) {
+                first_pos.insert(key, pos);
+                unique.push(pos);
+            }
+        }
+        self.stats
+            .lookups
+            .fetch_add(unique.len() as u64, Ordering::Relaxed);
+
+        let mut answers: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+        let (mut remaining, segments) = {
+            let t_lock = Instant::now();
+            let state = self.state.read().unwrap();
+            self.stats
+                .lock_wait_ns
+                .fetch_add(t_lock.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let t0 = Instant::now();
+            let mut remaining = Vec::with_capacity(unique.len());
+            for pos in unique {
+                let hit = state
+                    .active
+                    .get(keys[pos])
+                    .or_else(|| state.immutables.iter().rev().find_map(|m| m.get(keys[pos])));
+                if let Some(e) = hit {
+                    self.stats.memtable_hits.fetch_add(1, Ordering::Relaxed);
+                    answers[pos] = e.value.clone(); // None = memtable tombstone
+                } else {
+                    remaining.push(pos);
+                }
+            }
+            self.stats
+                .memtable_lookup_ns
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            (remaining, Arc::clone(&state.segments))
+        };
+        // SE2-M22 parity — one key hash per unique key, shared by every
+        // segment's bloom probe.
+        let mut bloom_hashes: HashMap<usize, (u64, u64)> = HashMap::new();
+        for seg in segments.iter().rev() {
+            self.stats
+                .segments_considered
+                .fetch_add(1, Ordering::Relaxed);
+            let mut wanted: Vec<usize> = Vec::with_capacity(remaining.len());
+            for &pos in &remaining {
+                let key = keys[pos];
+                if key < seg.key_min() || key > seg.key_max() {
+                    self.stats
+                        .segments_range_skipped
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let t_bloom = Instant::now();
+                let (h1, h2) = *bloom_hashes
+                    .entry(pos)
+                    .or_insert_with(|| SegmentReader::bloom_hashes(key));
+                let may = seg.bloom_may_contain_hashes(h1, h2);
+                self.stats
+                    .bloom_probe_ns
+                    .fetch_add(t_bloom.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                if !may {
+                    self.stats
+                        .segments_bloom_skipped
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                wanted.push(pos);
+            }
+            if wanted.is_empty() {
+                continue;
+            }
+            self.stats
+                .segments_index_searched
+                .fetch_add(wanted.len() as u64, Ordering::Relaxed);
+            let wanted_keys: Vec<&[u8]> = wanted.iter().map(|&p| keys[p]).collect();
+            let found = seg.get_many(&wanted_keys)?;
+            for (pos, e) in wanted.into_iter().zip(found) {
+                if let Some(e) = e {
+                    answers[pos] = if e.flags & FLAG_DELETE != 0 {
+                        None // tombstone: shadow everything older
+                    } else {
+                        Some(e.value)
+                    };
+                    // ponytail: linear retain per resolution — fine at batch
+                    // sizes (W4 fan-outs ≤ 1000)
+                    remaining.retain(|&p| p != pos);
+                }
+            }
+        }
+        // duplicates answered from their first position's lookup
+        for (pos, key) in keys.iter().enumerate() {
+            if let Some(&first) = first_pos.get(key) {
+                if first != pos {
+                    answers[pos] = answers[first].clone();
+                }
+            }
+        }
+        Ok(answers)
     }
 
     fn get_inner(&self, key: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {

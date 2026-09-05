@@ -612,6 +612,75 @@ impl KnowledgeRepository {
         }
     }
 
+    /// SE2-M25 — batch head resolution, cache-aware parity with `get_head`:
+    /// cache hits answer in place, misses go through one engine `get_many`.
+    pub fn get_heads_many(
+        &self,
+        koids: &[KOID],
+    ) -> KResult<Vec<Option<(u64, u64, LifecycleState)>>> {
+        let mut out: Vec<Option<(u64, u64, LifecycleState)>> = vec![None; koids.len()];
+        let mut misses: Vec<(usize, Vec<u8>)> = Vec::with_capacity(koids.len());
+        for (i, koid) in koids.iter().enumerate() {
+            if let Some(c) = &self.cache {
+                if let Some(head) = c.get_head(koid) {
+                    out[i] = Some(head);
+                    continue;
+                }
+            }
+            misses.push((i, head_key(koid)));
+        }
+        if misses.is_empty() {
+            return Ok(out);
+        }
+        let keys: Vec<&[u8]> = misses.iter().map(|(_, k)| k.as_slice()).collect();
+        let results = self.engine().get_many(&keys)?;
+        for ((i, _), res) in misses.into_iter().zip(results) {
+            if let Some(b) = res {
+                let head = decode_head(&b)?;
+                if let Some(c) = &self.cache {
+                    c.put_head(&koids[i], head.0, head.1, head.2);
+                }
+                out[i] = Some(head);
+            }
+        }
+        Ok(out)
+    }
+
+    /// SE2-M25 — batch object-version loads, cache-aware parity with
+    /// `get_object_version`: cache hits answer in place, misses go through
+    /// one engine `get_many`.
+    pub fn get_object_versions_many(
+        &self,
+        koids_and_ts: &[(KOID, u64)],
+    ) -> KResult<Vec<Option<KnowledgeObject>>> {
+        let mut out: Vec<Option<KnowledgeObject>> = vec![None; koids_and_ts.len()];
+        let mut misses: Vec<(usize, Vec<u8>)> = Vec::with_capacity(koids_and_ts.len());
+        for (i, (koid, ts)) in koids_and_ts.iter().enumerate() {
+            if let Some(c) = &self.cache {
+                if let Some(ko) = c.get_object(koid, *ts) {
+                    out[i] = Some(ko);
+                    continue;
+                }
+            }
+            misses.push((i, obj_key(koid, *ts)));
+        }
+        if misses.is_empty() {
+            return Ok(out);
+        }
+        let keys: Vec<&[u8]> = misses.iter().map(|(_, k)| k.as_slice()).collect();
+        let results = self.engine().get_many(&keys)?;
+        for ((i, _), res) in misses.into_iter().zip(results) {
+            if let Some(b) = res {
+                let ko = codec::decode_ko_wire(&b)?;
+                if let Some(c) = &self.cache {
+                    c.put_object(&koids_and_ts[i].0, koids_and_ts[i].1, &ko);
+                }
+                out[i] = Some(ko);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn get_object_at(&self, koid: &KOID, snap_ts: u64) -> KResult<Option<KnowledgeObject>> {
         let entries = self.engine().scan(&obj_prefix(koid))?;
         for (k, v) in entries.iter().rev() {

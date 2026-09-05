@@ -68,6 +68,10 @@ impl StorageEngine for AikoqlStorageEngineV2 {
         self.db.get(key).map_err(se)
     }
 
+    fn get_many(&self, keys: &[&[u8]]) -> KResult<Vec<Option<Vec<u8>>>> {
+        self.db.get_many(keys).map_err(se)
+    }
+
     fn scan(&self, prefix: &[u8]) -> KResult<Vec<(Vec<u8>, Vec<u8>)>> {
         self.db.scan(prefix).map_err(se)
     }

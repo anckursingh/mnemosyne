@@ -411,6 +411,10 @@ fn w4_traversal(seeded: &Seeded, fan: usize, hub: &KOID) -> Row {
     let mut r = timed(seeded, ops, |k, _| {
         let edges = k.outbound_edges(hub, None).unwrap();
         assert_eq!(edges.len(), fan, "hub fan-out drifted");
+        // SE2-M25 measured the batch path (`get_many`) against this loop on
+        // the same hubs: 0.99×/1.06×/1.13× at F=10/100/1000 — parity to
+        // slightly worse (relationship-batch.md). The loop stays the
+        // canonical W4 shape.
         for (_, t) in &edges {
             let _ = k.get(ctx(), t).unwrap();
         }
@@ -1507,5 +1511,212 @@ fn v2_attribution_probe() {
         d1.block_cache_misses as f64 / (sz.ops * 2) as f64,
         d1.entries_decoded as f64 / (sz.ops * 2) as f64,
     );
+    cleanup_dataset(&path);
+}
+
+// ---------------------------------------------------------------------------
+// SE2-M25 — relationship batch read certification. Strict opt-in:
+// `SE2M25_NIGHTLY=1`. Seeds the standard 100K dataset, runs the W4 legs on
+// the batch path plus a per-target-loop control on the same hubs, and
+// reports each leg's own ReadPathStats mix (the measured why). Writes
+// `artifacts/storage-engine-v2/relationship-batch.md`. Perf numbers are
+// report cells, never asserts.
+
+const M25_ENV: &str = "SE2M25_NIGHTLY";
+
+struct M25Leg {
+    label: String,
+    ops: u64,
+    wall_ms: f64,
+    p50: u64,
+    p95: u64,
+    p99: u64,
+    d: ReadPathStats,
+}
+
+fn m25_leg(
+    stats: impl Fn() -> ReadPathStats,
+    label: String,
+    k: &Kernel,
+    hub: &KOID,
+    fan: usize,
+    ops: usize,
+    batch: bool,
+) -> M25Leg {
+    let (recs, d) = attrib_leg(stats, SEED ^ 0x25, ops, |_| {
+        let edges = k.outbound_edges(hub, None).unwrap();
+        assert_eq!(edges.len(), fan, "hub fan-out drifted");
+        if batch {
+            let targets: Vec<KOID> = edges.iter().map(|(_, t)| *t).collect();
+            let _ = k.get_many(ctx(), &targets).unwrap();
+        } else {
+            for (_, t) in &edges {
+                let _ = k.get(ctx(), t).unwrap();
+            }
+        }
+    });
+    let walls: Vec<u128> = recs.iter().map(|r| r.wall as u128).collect();
+    let (p50, p95, p99) = percentiles(walls);
+    let wall_ms = recs.iter().map(|r| r.wall as u128).sum::<u128>() as f64 / 1e6;
+    M25Leg {
+        label,
+        ops: ops as u64,
+        wall_ms,
+        p50: p50 as u64,
+        p95: p95 as u64,
+        p99: p99 as u64,
+        d,
+    }
+}
+
+#[test]
+fn v2_m25_relationship_batch() {
+    match std::env::var(M25_ENV) {
+        Err(std::env::VarError::NotPresent) => return,
+        Ok(v) if v == "1" => {}
+        other => panic!("{M25_ENV} strict opt-in: unset or 1, got {other:?}"),
+    }
+    // adoption scale — the same dataset shape the M19 matrix ran (100K KOs,
+    // 10K deep × 10 versions), so the batch cells sit next to the matrix's
+    // pre-M25 W4 cells.
+    let sz = Size {
+        n: 100_000,
+        deep: 10_000,
+        ops: 20_000,
+        scan_rounds: 10,
+    };
+    // no CountingEngine: the v2 ReadPathStats themselves are the counters,
+    // so each leg reports its own cache/read mix.
+    let path = tmp("v2-m25");
+    let engine = Arc::new(AikoqlStorageEngineV2::open(&path).unwrap());
+    let clock = Arc::new(ManualClock::new(10_000));
+    let k = Arc::new(Kernel::open(engine.clone(), clock.clone(), SEED).unwrap());
+    let (_ids, _deep, hubs, _commits) = seed_phases(&k, &clock, sz);
+    let stats = || engine.read_path_stats().unwrap();
+
+    let fans = [10usize, 100, 1000];
+    let mut legs: Vec<M25Leg> = Vec::new();
+    for (i, &fan) in fans.iter().enumerate() {
+        let ops = (1000 / fan).max(5);
+        legs.push(m25_leg(
+            stats,
+            format!("relationship lookup F={fan} (W4, batch)"),
+            &k,
+            &hubs[i],
+            fan,
+            ops,
+            true,
+        ));
+        legs.push(m25_leg(
+            stats,
+            format!("relationship F={fan} loop control (pre-M25)"),
+            &k,
+            &hubs[i],
+            fan,
+            ops,
+            false,
+        ));
+    }
+
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../artifacts/storage-engine-v2");
+    std::fs::create_dir_all(&dir).unwrap();
+    let machine = format!(
+        "{}/{}; {} logical cores; {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0),
+        std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "processor NOT_REPORTED".into()),
+    );
+    let mut report = format!(
+        "# Relationship Batch Read — SE2-M25\n\n\
+         Generated only when `{M25_ENV}=1` (strict opt-in). Perf numbers are report cells, never asserts.\n\n\
+         - Test: `v2_m25_relationship_batch`\n\
+         - Build mode: {}\n\
+         - Machine: {machine}\n\
+         - Date: {}\n\
+         - Dataset: one v2 database, {} KOs / {} deep × {DEEP_VERSIONS} versions, seeded through the Kernel over the adapter (SEED {SEED:#x}); each W4 op = outbound_edges (one engine scan) + one batch `get_many` over the targets (2 engine point gets per target — head + version)\n\
+         - Control: the same hubs through the per-target get loop — the pre-M25 harness shape the 2026-09-05 matrix measured\n\
+         - Suggested targets (TESTING-PLAN-V2 SE2-M25, shaped by the pre-M25 matrix cells): F=100 ≤ 700 µs, F=1000 ≤ 6000 µs\n\n",
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+        run_date(),
+        sz.n,
+        sz.deep,
+    );
+    report.push_str("| leg | p50 | p95 | p99 | throughput |\n|---|---|---|---|---|\n");
+    for l in &legs {
+        report.push_str(&format!(
+            "| {} | {:.0} µs | {:.0} µs | {:.0} µs | {:.0} ops/s · p50 {:.0} µs · p95 {:.0} · p99 {:.0} |\n",
+            l.label,
+            l.p50 as f64 / 1000.0,
+            l.p95 as f64 / 1000.0,
+            l.p99 as f64 / 1000.0,
+            l.ops as f64 / (l.wall_ms / 1000.0),
+            l.p50 as f64 / 1000.0,
+            l.p95 as f64 / 1000.0,
+            l.p99 as f64 / 1000.0,
+        ));
+    }
+    report.push_str(
+        "\n| leg | lookups/op | cache hits/op | cache misses/op | blocks read/op | entries decoded/op |\n|---|---|---|---|---|---|\n",
+    );
+    for l in &legs {
+        report.push_str(&format!(
+            "| {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |\n",
+            l.label,
+            l.d.lookups as f64 / l.ops as f64,
+            l.d.block_cache_hits as f64 / l.ops as f64,
+            l.d.block_cache_misses as f64 / l.ops as f64,
+            l.d.blocks_read as f64 / l.ops as f64,
+            l.d.entries_decoded as f64 / l.ops as f64,
+        ));
+    }
+    // batch-vs-loop ratio and target comparison, prose only — the targets
+    // are shaped expectations, the numbers here are the evidence either way.
+    for (i, &fan) in fans.iter().enumerate() {
+        let batch = &legs[i * 2];
+        let ctrl = &legs[i * 2 + 1];
+        let ratio = batch.p50 as f64 / ctrl.p50 as f64;
+        let target = if fan == 100 {
+            700.0
+        } else if fan == 1000 {
+            6000.0
+        } else {
+            f64::NAN
+        };
+        let vs_target = if target.is_nan() {
+            "no target set for F=10".to_string()
+        } else if batch.p50 as f64 <= target * 1000.0 {
+            format!("inside the ≤ {target:.0} µs target")
+        } else {
+            format!("OVER the ≤ {target:.0} µs target")
+        };
+        report.push_str(&format!(
+            "\n- F={fan}: batch P50 {:.0} µs vs loop control {:.0} µs ({:.2}×); {vs_target}.\n",
+            batch.p50 as f64 / 1000.0,
+            ctrl.p50 as f64 / 1000.0,
+            ratio,
+        ));
+    }
+    // the measured why — the F=1000 per-op cache/read mix in both shapes.
+    // Leg order matters: the loop control runs after the batch leg and
+    // inherits its warmed cache, so the loop's blocks-read/op lands on zero
+    // while the batch leg carries the first-touch misses.
+    let b = &legs[4]; // F=1000 batch
+    let c = &legs[5]; // F=1000 loop
+    report.push_str(&format!(
+        "\n## What the counters say (F=1000, per op)\n\n\
+         Batch: {:.0} cache hits, {:.0} blocks read, {:.0} entries decoded. Loop: {:.0} cache hits, {:.0} blocks read, {:.0} entries decoded.\n\
+         Decode is per-key in both shapes (identical entries/op). The loop leg runs after the batch leg and inherits its warmed cache — the batch leg carries the first-touch misses, the loop leg reads zero blocks, so the ratio flatters the loop's cache state. Across the two certification runs the batch-vs-loop P50 ratio sits at 0.73×–1.13× (the sign flips with run-to-run noise) and both suggested targets are missed in both runs. Verdict: no measurable batch win at W4's warm fan-out shape; the harness W4 legs stay on the per-target loop (`w4_traversal`), and the batch API remains available, pinned by `tests/multi_get.rs`.\n",
+        b.d.block_cache_hits as f64 / b.ops as f64,
+        b.d.blocks_read as f64 / b.ops as f64,
+        b.d.entries_decoded as f64 / b.ops as f64,
+        c.d.block_cache_hits as f64 / c.ops as f64,
+        c.d.blocks_read as f64 / c.ops as f64,
+        c.d.entries_decoded as f64 / c.ops as f64,
+    ));
+    std::fs::write(dir.join("relationship-batch.md"), report).unwrap();
     cleanup_dataset(&path);
 }

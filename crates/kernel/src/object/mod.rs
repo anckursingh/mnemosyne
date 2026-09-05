@@ -30,6 +30,25 @@ impl ObjectManager {
         }
     }
 
+    /// SE2-M25 — batch head-version loads: one head batch, then one version
+    /// batch over the resolved timestamps. Fail-fast like the per-target
+    /// path (a missing head or version is `KError::NotFound`, which is how
+    /// `Kernel::get` surfaces an absent KO).
+    pub fn get_many(&self, koids: &[KOID]) -> KResult<Vec<KnowledgeObject>> {
+        let heads = self.repo.get_heads_many(koids)?;
+        let mut wanted: Vec<(KOID, u64)> = Vec::with_capacity(koids.len());
+        for (i, head) in heads.into_iter().enumerate() {
+            let (_version, ts, _state) = head.ok_or(KError::NotFound(koids[i]))?;
+            wanted.push((koids[i], ts));
+        }
+        let versions = self.repo.get_object_versions_many(&wanted)?;
+        versions
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| v.ok_or(KError::NotFound(wanted[i].0)))
+            .collect()
+    }
+
     /// Load a KO at a specific snapshot timestamp.
     pub fn get_at(&self, koid: &KOID, snap_ts: u64) -> KResult<Option<KnowledgeObject>> {
         self.repo.get_object_at(koid, snap_ts)
