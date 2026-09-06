@@ -10,7 +10,6 @@
 mod common;
 
 use aikoql_storage_v2::db::{Config, Db, DurabilityMode};
-use aikoql_storage_v2::format::FormatError;
 use aikoql_storage_v2::identity::directory::{IdentityResolver, LocalIdentityDirectory};
 use aikoql_storage_v2::identity::topology::{LocalReplicaDirectory, ReplicaDirectory};
 use aikoql_storage_v2::identity::{LogicalId, ObjectId, ReplicaId};
@@ -196,18 +195,26 @@ fn mt006_replay_restores_memtable_identity() {
 }
 
 #[test]
-fn mt007_get_object_fails_closed_after_flush() {
+fn mt007_get_object_reads_flushed_segment() {
+    // SE2-M34 lifted the M33 fail-closed boundary: v3 blocks carry the rid
+    // on disk, so get_object answers through the segment read path after
+    // the flush — and the §11 filter holds on disk too: a newer byte-API
+    // row at the same key never answers the object, and the object's own
+    // tombstone does.
     let db = Db::open(Config::new(dir("mt007"))).unwrap();
     let a = oid(0xA1);
     db.put_object(a, b"k", b"v1").unwrap();
     db.flush().unwrap();
-    // The memtable miss cannot be answered from segments: on-disk entries
-    // carry no replica_id until block v3 (SE2-M34). Reading unqualified
-    // bytes would violate §11 — fail closed at the milestone boundary.
-    assert!(matches!(
-        db.get_object(a, b"k"),
-        Err(FormatError::Unsupported(_))
-    ));
+    assert_eq!(db.get_object(a, b"k").unwrap(), Some(b"v1".to_vec()));
+    db.put(b"k", b"byte-value").unwrap(); // newer seq, rid 0, in the memtable
+    assert_eq!(
+        db.get_object(a, b"k").unwrap(),
+        Some(b"v1".to_vec()),
+        "the byte row never answers the object read"
+    );
+    db.delete_object(a, b"k").unwrap();
+    db.flush().unwrap(); // the tombstone lands in its own v3 segment
+    assert_eq!(db.get_object(a, b"k").unwrap(), None, "tombstoned on disk");
 }
 
 #[test]

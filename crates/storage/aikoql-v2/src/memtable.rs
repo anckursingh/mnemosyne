@@ -35,6 +35,12 @@ impl Memtable {
         self.map.is_empty()
     }
 
+    /// SE2-M34 — any identity-carrying entry: the flush writes v3 blocks
+    /// iff this is true (rid-0 rows alone stay v2, byte-identical to M9).
+    pub fn has_identity(&self) -> bool {
+        self.map.values().any(|e| e.replica_id != ReplicaId(0))
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }

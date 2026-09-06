@@ -43,6 +43,7 @@ use crate::placement::directory::{
     load_placement_logs, merge_placement, orphan_placement_logs, placement_log_path,
     validate_segment_location, PhysicalLocation, Placement, PlacementLog, PlacementRecord,
 };
+use crate::placement::{BlockId, SegmentId};
 use crate::segment::{
     SegmentAttach, SegmentEntry, SegmentReader, SegmentWriter, FLAG_DELETE, FLAG_PUT,
 };
@@ -773,13 +774,13 @@ impl Db {
         self.write(&[Op::DeleteObject(rid, key.to_vec())])
     }
 
-    /// SE2-M33 — the §13 read path: resolve → read through the identity
+    /// SE2-M33/M34 — the §13 read path: resolve → read through the identity
     /// filter. The memtable probe matches the object's OWN entries
     /// (replica_id == rid) — a byte-API row at the same key is another
-    /// layer's data and never answers an object read (§11). Segments
-    /// cannot answer yet (on-disk entries carry no replica_id until block
-    /// v3 — SE2-M34), so a miss with segments present fails closed
-    /// instead of reading unqualified bytes.
+    /// layer's data and never answers an object read (§11). SE2-M34 lifted
+    /// the M33 fail-closed boundary: v3 segments answer through the
+    /// rid-filtered bounded probe, newest-first; the object's own tombstone
+    /// on disk shadows (None), and v1/v2 segments hold no rid rows.
     pub fn get_object(&self, oid: ObjectId, key: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
         let Some(lid) = LocalIdentityDirectory::new(self).resolve(oid)? else {
             return Ok(None); // never created — not a read error
@@ -787,7 +788,9 @@ impl Db {
         let rid = LocalReplicaDirectory::new(self)
             .resolve_local(lid)?
             .ok_or_else(|| FormatError::Corrupt(format!("logical {lid:?} has no local replica")))?;
-        let (value, has_segments) = {
+        // SE2-M10 — the state guard covers the memtable probes and the
+        // segments arc clone; the disk probes run after the guard drops.
+        let (value, segments) = {
             let state = self.state.read().unwrap();
             if let Some(e) = state.active.get_by_rid(key, rid) {
                 return Ok(e.value.clone());
@@ -797,14 +800,16 @@ impl Db {
                     return Ok(e.value.clone());
                 }
             }
-            (None, !state.segment_records.is_empty())
+            (None, Arc::clone(&state.segments))
         };
-        if has_segments {
-            return Err(FormatError::Unsupported(
-                "get_object past flush: segment entries carry no replica_id until \
-                 block v3 (SE2-M34)"
-                    .into(),
-            ));
+        for seg in segments.iter().rev() {
+            if let Some(e) = seg.get_by_rid(key, rid)? {
+                return Ok(if e.flags & FLAG_DELETE != 0 {
+                    None
+                } else {
+                    Some(e.value)
+                });
+            }
         }
         Ok(value)
     }
@@ -1184,11 +1189,18 @@ impl Db {
             return Ok(());
         }
         let mut new_segments = Vec::with_capacity(state.immutables.len());
+        let mut anchors: HashMap<ReplicaId, (u64, SegmentId, BlockId, u32)> = HashMap::new();
         for mem in state.immutables.drain(..) {
             let id = state.next_segment_id;
             state.next_segment_id += 1;
             let path = segment_path(&config.dir, id);
-            let mut writer = SegmentWriter::new_v2(config.block_target);
+            // SE2-M34 — identity-carrying immutables become v3 blocks (rid
+            // per entry); pure byte-API ones stay v2, byte-identical to M9.
+            let mut writer = if mem.has_identity() {
+                SegmentWriter::new_v3(config.block_target)
+            } else {
+                SegmentWriter::new_v2(config.block_target)
+            };
             // into_entries: the flushed table is consumed — keys/values
             // move into the writer, no second copy (SE2-M15).
             for ((key, seq), e) in mem.into_entries() {
@@ -1202,9 +1214,22 @@ impl Db {
                     value: e.value.unwrap_or_default(),
                     seq,
                     flags,
+                    replica_id: e.replica_id,
                 });
             }
-            let (file_size, checksum) = writer.publish(&path)?;
+            let (file_size, checksum, seg_anchors) = writer.publish_with_anchors(&path)?;
+            // One flushed replica may span several immutables (rotates
+            // between writes): the max-seq anchor across ALL segments this
+            // flush writes wins.
+            for a in seg_anchors {
+                let slot = (a.seq, SegmentId(id), a.block_id, a.entry_offset);
+                match anchors.get(&a.replica_id) {
+                    Some(&(best_seq, ..)) if best_seq >= a.seq => {}
+                    _ => {
+                        anchors.insert(a.replica_id, slot);
+                    }
+                }
+            }
             let reader = SegmentReader::open_with(&path, cache.clone(), Some(Arc::clone(stats)))?;
             let record = SegmentRecord {
                 segment_id: id,
@@ -1219,6 +1244,24 @@ impl Db {
             };
             state.segment_records.push(record);
             new_segments.push(Arc::new(reader));
+        }
+        // SE2-M34 — every flushed replica publishes its Segment placement
+        // in the SAME window as its segment (the §23 order): the anchor is
+        // the replica's max-seq entry location, the record's generation
+        // fresh (§32: a move IS a new generation).
+        for (rid, (_seq, segment_id, block_id, entry_offset)) in anchors {
+            let pgen = state.next_placement_generation;
+            state.next_placement_generation += 1;
+            let placement = Placement::Segment(PhysicalLocation {
+                segment_id,
+                block_id,
+                entry_offset,
+                generation: pgen,
+            });
+            merge_placement(&mut state.placements, rid, placement)?;
+            state
+                .pending_placements
+                .push(PlacementRecord { rid, placement });
         }
         state.generation += 1;
         // SE2-M30/M32 — the pending identity/replica/placement deltas
@@ -1307,6 +1350,23 @@ impl Db {
     /// engine stays key-space-generic. ARCHIVE rows land in
     /// `archive/ARCHIVE-{id:06}.seg` and leave the live key space.
     pub fn compact_with(&self, policy: &dyn RetentionPolicy) -> Result<CompactStats, FormatError> {
+        // SE2-M34 — fail closed while any placement names a segment: the
+        // merge rewrites segments as v2 (rids dropped) and deletes the old
+        // files, so a Segment placement would dangle into a Corrupt reopen.
+        // SE2-M35 relocates placements through compaction; until it ships,
+        // compacting identity-carrying data is caller misuse.
+        if self
+            .state
+            .read()
+            .unwrap()
+            .placements
+            .values()
+            .any(|p| matches!(p, Placement::Segment(_)))
+        {
+            return Err(FormatError::Unsupported(
+                "compact with Segment placements: relocation lands in SE2-M35".into(),
+            ));
+        }
         let mut state = self.state.write().unwrap();
         if state.segments.is_empty() {
             return Ok(CompactStats::default());

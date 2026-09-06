@@ -22,6 +22,7 @@ pub fn entry(key: &str, value: &str, seq: u64, flags: u8) -> SegmentEntry {
         value: value.as_bytes().to_vec(),
         seq,
         flags,
+        replica_id: aikoql_storage_v2::identity::ReplicaId(0),
     }
 }
 

@@ -14,10 +14,10 @@
 //! entry_count u32 | compressed_size u32 | uncompressed_size u32 |
 //! sha256-8(20-byte header + payload)` + payload.
 //! Types: 0 data, 1 index, 2 bloom. Compression 0 = none.
-//! Data blocks are version 1 or 2 (SE2-M9); index and bloom are always
-//! version 1. Anything newer fails closed: a block whose checksum
-//! validates is Unsupported (a future format), a stale checksum is
-//! Corrupt.
+//! Data blocks are version 1, 2 (SE2-M9) or 3 (SE2-M34); index and bloom
+//! are always version 1. Anything newer fails closed: a block whose
+//! checksum validates is Unsupported (a future format), a stale checksum
+//! is Corrupt.
 //!
 //! Entry: `shared_prefix_len u16 | key_suffix_len u16 | key_suffix |
 //! value_len u32 | value | seq u64 | flags u8`. Entries are sorted
@@ -32,6 +32,12 @@
 //! decodes only the one interval slice it lands in (≤ 16 entries — a
 //! multi-version equal-key run extends its interval, see
 //! `last_restart_key` in `publish`).
+//!
+//! v3 data payload (SE2-M34): the v2 table with `replica_id u64` appended
+//! after each entry's flags — the v2 prefix (through flags) decodes
+//! identically, so the restart table and bounded lookup are shared. Only
+//! v3 blocks persist the rid; v1/v2 decode it as 0 (their writers never
+//! emit it) and their bytes stay golden-pinned.
 //!
 //! Index payload: per data block `first_key_len u16 | first_key |
 //! last_key_len u16 | last_key | block_offset u64 | entry_count u32`.
@@ -49,10 +55,13 @@
 
 use crate::cache::BlockCache;
 use crate::format::{checksum8, publish_atomic_writer, Cursor, FormatError};
+use crate::identity::ReplicaId;
+use crate::placement::BlockId;
 use crate::stats::Stats;
 use aikoql_kernel::knowledge::kom::sha256;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::ops::Range;
@@ -95,6 +104,19 @@ pub struct SegmentEntry {
     pub value: Vec<u8>,
     pub seq: u64,
     pub flags: u8,
+    /// SE2-M34 — the owning replica (0 = byte API). Persisted by v3 data
+    /// blocks only; v1/v2 decode it as 0 (their writers never emit it).
+    pub replica_id: ReplicaId,
+}
+
+/// SE2-M34 — one replica's anchor in a published segment: its max-seq
+/// entry's location (block-local entry index), for the placement directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentAnchor {
+    pub replica_id: ReplicaId,
+    pub seq: u64,
+    pub block_id: BlockId,
+    pub entry_offset: u32,
 }
 
 /// Buffers entries and writes them as one immutable segment.
@@ -104,6 +126,9 @@ pub struct SegmentWriter {
     /// SE2-M9 — v2 data blocks (restart points). `new` stays v1: the M1
     /// golden pins the v1 writer byte-exact.
     v2: bool,
+    /// SE2-M34 — v3 data blocks (restart points + per-entry replica id).
+    /// v3 implies v2: the restart table is shared.
+    v3: bool,
 }
 
 impl SegmentWriter {
@@ -112,6 +137,7 @@ impl SegmentWriter {
             target_block_bytes,
             entries: Vec::new(),
             v2: false,
+            v3: false,
         }
     }
 
@@ -120,11 +146,30 @@ impl SegmentWriter {
             target_block_bytes,
             entries: Vec::new(),
             v2: true,
+            v3: false,
+        }
+    }
+
+    /// SE2-M34 — v3 data blocks: the v2 restart table plus the per-entry
+    /// rid, so identity rows survive the flush.
+    pub fn new_v3(target_block_bytes: usize) -> Self {
+        SegmentWriter {
+            target_block_bytes,
+            entries: Vec::new(),
+            v2: true,
+            v3: true,
         }
     }
 
     pub fn push(&mut self, entry: SegmentEntry) {
         self.entries.push(entry);
+    }
+
+    /// SE2-M34 — `publish` keeps its M15 shape (the manifest fields); the
+    /// anchor list is the identity flush's extra return.
+    pub fn publish(&mut self, path: &Path) -> Result<(u64, u64), FormatError> {
+        self.publish_with_anchors(path)
+            .map(|(file_size, checksum, _)| (file_size, checksum))
     }
 
     /// Sort (key asc, seq desc), split into target-sized data blocks, and
@@ -137,8 +182,12 @@ impl SegmentWriter {
     /// entries themselves + one block + the index and bloom — not several
     /// whole-segment copies. Returns (file_size, checksum8) of the file as
     /// published — the manifest record's fields, so callers never read the
-    /// segment back.
-    pub fn publish(&mut self, path: &Path) -> Result<(u64, u64), FormatError> {
+    /// segment back — plus SE2-M34's anchors: one per non-zero replica id,
+    /// its max-seq entry's (block, offset).
+    pub fn publish_with_anchors(
+        &mut self,
+        path: &Path,
+    ) -> Result<(u64, u64, Vec<SegmentAnchor>), FormatError> {
         if self.target_block_bytes == 0 {
             return Err(FormatError::Invalid("target block size must be > 0".into()));
         }
@@ -162,6 +211,7 @@ impl SegmentWriter {
         let seq_lo = entries.iter().map(|e| e.seq).min().expect("non-empty");
         let seq_hi = entries.iter().map(|e| e.seq).max().expect("non-empty");
         let v2 = self.v2;
+        let v3 = self.v3;
 
         // Block boundaries without the payloads. The split state machine
         // mirrors the encode pass exactly — including the buffered writer's
@@ -176,7 +226,14 @@ impl SegmentWriter {
             let mut start = 0usize;
             for (i, e) in entries.iter().enumerate() {
                 let shared_c = shared_of(&prev, e);
-                let est = 2 + 2 + (e.key.len() - shared_c) + 4 + e.value.len() + 8 + 1;
+                let est = 2
+                    + 2
+                    + (e.key.len() - shared_c)
+                    + 4
+                    + e.value.len()
+                    + 8
+                    + 1
+                    + if v3 { 8 } else { 0 };
                 if len > 0 && len + est > self.target_block_bytes {
                     bounds.push((start, i));
                     len = 0;
@@ -199,7 +256,14 @@ impl SegmentWriter {
                 // block's prev is None) — recomputed like the encode pass,
                 // not from the split estimate above.
                 let shared = if is_restart { 0 } else { shared_of(&prev, e) };
-                len += 2 + 2 + (e.key.len() - shared) + 4 + e.value.len() + 8 + 1;
+                len += 2
+                    + 2
+                    + (e.key.len() - shared)
+                    + 4
+                    + e.value.len()
+                    + 8
+                    + 1
+                    + if v3 { 8 } else { 0 };
                 if is_restart {
                     last_restart_key = Some(e.key.clone());
                 }
@@ -218,6 +282,7 @@ impl SegmentWriter {
         let mut payload = Vec::new();
         let mut table = Vec::new();
         let mut restarts: Vec<u32> = Vec::new();
+        let mut anchors: HashMap<ReplicaId, SegmentAnchor> = HashMap::new();
         let mut file_size = 0u64;
         let mut whole = Sha256::new();
 
@@ -242,7 +307,7 @@ impl SegmentWriter {
 
             // Data blocks, written as they complete (index offsets are
             // final-file positions).
-            for &(start, end) in &bounds {
+            for (block_id, &(start, end)) in bounds.iter().enumerate() {
                 payload.clear();
                 restarts.clear();
                 let mut prev: Option<Vec<u8>> = None;
@@ -265,6 +330,31 @@ impl SegmentWriter {
                     payload.extend_from_slice(&e.value);
                     payload.extend_from_slice(&e.seq.to_le_bytes());
                     payload.push(e.flags);
+                    if v3 {
+                        // SE2-M34 — the rid rides after the flags: the v2
+                        // prefix (through flags) decodes identically.
+                        payload.extend_from_slice(&e.replica_id.0.to_le_bytes());
+                    }
+                    if v3 && e.replica_id != ReplicaId(0) {
+                        // Anchor: the rid's max-seq entry. Byte-API rows
+                        // (rid 0) never anchor.
+                        let anchor = SegmentAnchor {
+                            replica_id: e.replica_id,
+                            seq: e.seq,
+                            block_id: BlockId(block_id as u32),
+                            entry_offset: count as u32,
+                        };
+                        match anchors.entry(e.replica_id) {
+                            Entry::Vacant(v) => {
+                                v.insert(anchor);
+                            }
+                            Entry::Occupied(mut o) => {
+                                if e.seq > o.get().seq {
+                                    *o.get_mut() = anchor;
+                                }
+                            }
+                        }
+                    }
                     prev = Some(e.key.clone());
                     let d = sha256(&e.key);
                     let h1 = u64::from_le_bytes(d[..8].try_into().expect("sha256 len"));
@@ -294,7 +384,7 @@ impl SegmentWriter {
                         );
                     }
                     table.extend_from_slice(&payload);
-                    encode_block(BLOCK_DATA, count_u32, &table, 2u16)
+                    encode_block(BLOCK_DATA, count_u32, &table, if v3 { 3 } else { 2 })
                 } else {
                     encode_block(BLOCK_DATA, count_u32, &payload, SEGMENT_VERSION)
                 };
@@ -342,7 +432,7 @@ impl SegmentWriter {
 
             let digest = whole.finalize();
             let checksum = u64::from_le_bytes(digest[..8].try_into().expect("sha256-8 slice"));
-            Ok((file_size, checksum))
+            Ok((file_size, checksum, anchors.into_values().collect()))
         })
     }
 }
@@ -414,6 +504,8 @@ struct DataBlock {
     entries: u32,
     /// SE2-M9 — v2 payload (restart table) vs v1 (plain entries).
     v2: bool,
+    /// SE2-M34 — v3 payload (v2 restart table + per-entry rid). v3 ⇒ v2.
+    v3: bool,
     /// Key ranges into the reader's index payload.
     first: Range<usize>,
     last: Range<usize>,
@@ -584,10 +676,12 @@ impl SegmentReader {
             let compressed = hcur.u32()? as usize;
             hcur.u32()?; // uncompressed size (same: compression 0)
             let stored: [u8; 8] = hcur.take(8)?.try_into().expect("8-byte checksum");
-            // SE2-M9 — data blocks are version 1|2, index and bloom stay
-            // version 1. Anything else fails closed: a valid checksum is a
-            // future format (Unsupported), a stale one is damage (Corrupt).
-            let in_set = version == SEGMENT_VERSION || (version == 2 && kind == BLOCK_DATA);
+            // SE2-M9/M34 — data blocks are version 1|2|3, index and bloom
+            // stay version 1. Anything else fails closed: a valid checksum
+            // is a future format (Unsupported), a stale one is damage
+            // (Corrupt).
+            let in_set = version == SEGMENT_VERSION
+                || ((version == 2 || version == 3) && kind == BLOCK_DATA);
             if !in_set {
                 if version == 0 {
                     return Err(FormatError::Corrupt("block version 0".into()));
@@ -603,7 +697,7 @@ impl SegmentReader {
                     )));
                 }
                 return Err(FormatError::Unsupported(format!(
-                    "block version {version} (this build: data 1|2, index/bloom 1)"
+                    "block version {version} (this build: data 1|2|3, index/bloom 1)"
                 )));
             }
             cur += BLOCK_HEADER_LEN as u64;
@@ -625,7 +719,8 @@ impl SegmentReader {
                         header: header_off,
                         payload_len: compressed,
                         entries,
-                        v2: version == 2,
+                        v2: version == 2 || version == 3,
+                        v3: version == 3,
                         first: 0..0,
                         last: 0..0,
                         validated: AtomicBool::new(false),
@@ -806,6 +901,21 @@ impl SegmentReader {
         self.entry_count
     }
 
+    /// SE2-M34 — the entry at (block, offset): the full decode of that
+    /// block, nth entry (offsets are block-local entry indexes — the
+    /// placement anchors' shape). Out-of-range is None, not an error.
+    pub fn entry_at(
+        &self,
+        block_id: BlockId,
+        entry_offset: u32,
+    ) -> Result<Option<SegmentEntry>, FormatError> {
+        if block_id.0 as usize >= self.data.len() {
+            return Ok(None);
+        }
+        let entries = self.block_entries(block_id.0 as usize)?;
+        Ok(entries.into_iter().nth(entry_offset as usize))
+    }
+
     pub fn block_count(&self) -> u32 {
         self.block_count
     }
@@ -912,7 +1022,7 @@ impl SegmentReader {
             let payload = &raw[BLOCK_HEADER_LEN..];
             for pos in positions {
                 let t1 = self.stats.as_ref().map(|_| Instant::now());
-                let res = self.block_get_v2(keys[pos], payload)?;
+                let res = self.block_get_v2(keys[pos], payload, b.v3, None)?;
                 if let (Some(st), Some(t1)) = (&self.stats, t1) {
                     st.block_decode_ns
                         .fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1049,7 +1159,7 @@ impl SegmentReader {
         }
         let raw = self.block_raw(i)?;
         let t0 = self.stats.as_ref().map(|_| Instant::now());
-        let out = self.block_get_v2(key, &raw[BLOCK_HEADER_LEN..])?;
+        let out = self.block_get_v2(key, &raw[BLOCK_HEADER_LEN..], b.v3, None)?;
         if let (Some(st), Some(t0)) = (&self.stats, t0) {
             st.block_decode_ns
                 .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1057,15 +1167,48 @@ impl SegmentReader {
         Ok(out)
     }
 
-    /// Bounded v2 point lookup. The restart table is validated up front
+    /// SE2-M34 — the object's head within a v3 segment: the newest entry
+    /// of `key` whose replica_id matches, decoding the same bounded
+    /// restart interval the byte-API lookup decodes. Other replicas' rows
+    /// (rid 0 = byte API included) never answer (§11). v1/v2 blocks persist
+    /// no replica id, so they hold no object rows — None, not an error.
+    pub fn get_by_rid(
+        &self,
+        key: &[u8],
+        rid: ReplicaId,
+    ) -> Result<Option<SegmentEntry>, FormatError> {
+        let Some(i) = self.locate(key) else {
+            return Ok(None);
+        };
+        let b = &self.data[i];
+        if !b.v3 {
+            return Ok(None);
+        }
+        let raw = self.block_raw(i)?;
+        let t0 = self.stats.as_ref().map(|_| Instant::now());
+        let out = self.block_get_v2(key, &raw[BLOCK_HEADER_LEN..], true, Some(rid))?;
+        if let (Some(st), Some(t0)) = (&self.stats, t0) {
+            st.block_decode_ns
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        Ok(out)
+    }
+
+    /// Bounded v2/v3 point lookup. The restart table is validated up front
     /// (offsets inside the payload, full keys at restart positions, keys
     /// strictly increasing) so the binary search below cannot silently
     /// misread damaged data — it fails closed instead. Stats count only
     /// decoded interval entries; restart probes are key reads, not decodes.
+    /// SE2-M34: `v3` payloads carry the rid after the flags; a `rid` filter
+    /// keeps scanning the key's equal-key run past other replicas' rows
+    /// (the run is seq-descending, so the first matching entry is the
+    /// object's head) — `None` answers the raw key-space head as before.
     fn block_get_v2(
         &self,
         key: &[u8],
         payload: &[u8],
+        v3: bool,
+        rid: Option<ReplicaId>,
     ) -> Result<Option<SegmentEntry>, FormatError> {
         let mut cur = Cursor::new(payload);
         cur.u16()?; // restart interval (stored for forward compat)
@@ -1131,13 +1274,24 @@ impl SegmentReader {
                 let value = cur.vec()?;
                 let seq = cur.u64()?;
                 let flags = cur.u8()?;
-                out = Some(SegmentEntry {
-                    key: scratch.clone(),
-                    value,
-                    seq,
-                    flags,
-                });
-                break;
+                let entry_rid = if v3 {
+                    ReplicaId(cur.u64()?)
+                } else {
+                    ReplicaId(0)
+                };
+                if rid.is_none_or(|r| entry_rid == r) {
+                    out = Some(SegmentEntry {
+                        key: scratch.clone(),
+                        value,
+                        seq,
+                        flags,
+                        replica_id: entry_rid,
+                    });
+                    break;
+                }
+                // Another replica's row at this key — the run continues
+                // seq-descending (the rid's head may sit below).
+                continue;
             }
             if scratch.as_slice() > key {
                 break; // entries are sorted — nothing further matches
@@ -1146,6 +1300,9 @@ impl SegmentReader {
             cur.take(value_len)?;
             cur.u64()?; // seq
             cur.u8()?; // flags
+            if v3 {
+                cur.u64()?; // SE2-M34 — replica id
+            }
         }
         if let Some(st) = &self.stats {
             st.entries_decoded.fetch_add(decoded, Ordering::Relaxed);
@@ -1194,12 +1351,18 @@ impl SegmentReader {
             let value = cur.vec()?;
             let seq = cur.u64()?;
             let flags = cur.u8()?;
+            let replica_id = if b.v3 {
+                ReplicaId(cur.u64()?) // SE2-M34 — the rid after the flags
+            } else {
+                ReplicaId(0)
+            };
             prev = key.clone();
             out.push(SegmentEntry {
                 key,
                 value,
                 seq,
                 flags,
+                replica_id,
             });
         }
         if !cur.is_empty() {
@@ -1288,6 +1451,7 @@ impl SegmentReader {
             pos: 0,
             scratch: Vec::new(),
             last: None,
+            v3: false,
             done: false,
         }
     }
@@ -1310,6 +1474,8 @@ pub struct SegmentScan<'a> {
     pos: usize,
     scratch: Vec<u8>,
     last: Option<Vec<u8>>,
+    /// SE2-M34 — the loaded block is v3 (entries carry the rid).
+    v3: bool,
     done: bool,
 }
 
@@ -1331,6 +1497,7 @@ impl<'a> SegmentScan<'a> {
         let raw = self.reader.block_raw(self.block)?;
         self.pos = scan_seek_pos(&raw[BLOCK_HEADER_LEN..], b.v2, self.start)?;
         self.raw = Some(raw);
+        self.v3 = b.v3;
         self.block += 1;
         self.scratch.clear();
         Ok(true)
@@ -1381,7 +1548,7 @@ impl<'a> Iterator for SegmentScan<'a> {
             // The first loaded block may hold keys before start (the seek
             // lands at most one restart interval back): skip their bodies.
             if self.scratch.as_slice() < self.start {
-                match skip_entry_body(&mut cur) {
+                match skip_entry_body(&mut cur, self.v3) {
                     Ok(()) => {}
                     Err(e) => return Some(Err(e)),
                 }
@@ -1394,7 +1561,7 @@ impl<'a> Iterator for SegmentScan<'a> {
             }
             // Versions of one key are consecutive — yield the head only.
             if self.last.as_deref() == Some(self.scratch.as_slice()) {
-                match skip_entry_body(&mut cur) {
+                match skip_entry_body(&mut cur, self.v3) {
                     Ok(()) => {}
                     Err(e) => return Some(Err(e)),
                 }
@@ -1413,6 +1580,14 @@ impl<'a> Iterator for SegmentScan<'a> {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
+            let replica_id = if self.v3 {
+                match cur.u64() {
+                    Ok(v) => ReplicaId(v),
+                    Err(e) => return Some(Err(e)),
+                }
+            } else {
+                ReplicaId(0)
+            };
             self.pos += cur.pos();
             let key = self.scratch.clone();
             self.last = Some(key.clone());
@@ -1421,6 +1596,7 @@ impl<'a> Iterator for SegmentScan<'a> {
                 value,
                 seq,
                 flags,
+                replica_id,
             }));
         }
     }
@@ -1428,11 +1604,14 @@ impl<'a> Iterator for SegmentScan<'a> {
 
 /// Skip the value/seq/flags tail of an entry whose key is out of range or
 /// an older version — no clone for rows the scan will not return.
-fn skip_entry_body(cur: &mut Cursor<'_>) -> Result<(), FormatError> {
+fn skip_entry_body(cur: &mut Cursor<'_>, v3: bool) -> Result<(), FormatError> {
     let value_len = cur.u32()? as usize;
     cur.take(value_len)?;
     cur.u64()?; // seq
     cur.u8()?; // flags
+    if v3 {
+        cur.u64()?; // SE2-M34 — replica id
+    }
     Ok(())
 }
 

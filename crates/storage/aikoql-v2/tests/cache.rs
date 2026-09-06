@@ -9,6 +9,7 @@
 mod common;
 
 use aikoql_storage_v2::db::{Config, Db};
+use aikoql_storage_v2::identity::ReplicaId;
 use aikoql_storage_v2::segment::{SegmentEntry, SegmentReader, SegmentWriter};
 use common::dir;
 use std::path::Path;
@@ -132,6 +133,7 @@ fn bloom_never_misses_and_false_positive_rate_is_sane() {
             value: vec![b'v'; 32],
             seq: i,
             flags: 1, // FLAG_PUT
+            replica_id: ReplicaId(0),
         });
     }
     writer.publish(&path).unwrap();

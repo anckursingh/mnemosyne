@@ -8,6 +8,7 @@ mod common;
 
 use aikoql_storage_v2::db::{manifest_path, segment_path, Config, Db, WAL_FILE};
 use aikoql_storage_v2::format::{checksum8, Current, Manifest, SegmentRecord, FORMAT_VERSION};
+use aikoql_storage_v2::identity::ReplicaId;
 use aikoql_storage_v2::segment::{SegmentEntry, SegmentReader, SegmentWriter, FLAG_PUT};
 use common::dir;
 use std::time::Instant;
@@ -55,6 +56,7 @@ fn recovery_independence_10gib_segments_100mib_wal() {
                 value: big.clone(),
                 seq: i + 1,
                 flags: FLAG_PUT,
+                replica_id: ReplicaId(0),
             });
         }
         let path = segment_path(&a, seg);

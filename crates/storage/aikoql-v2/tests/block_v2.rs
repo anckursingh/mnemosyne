@@ -15,6 +15,7 @@ mod common;
 use aikoql_kernel::knowledge::kom::sha256;
 use aikoql_storage_v2::db::{Config, Db};
 use aikoql_storage_v2::format::FormatError;
+use aikoql_storage_v2::identity::ReplicaId;
 use aikoql_storage_v2::segment::{
     SegmentEntry, SegmentReader, SegmentWriter, FLAG_DELETE, FLAG_PUT, FLAG_VERSION,
 };
@@ -134,6 +135,7 @@ fn restart_search_correctness() {
             value: set[k].clone(),
             seq: 1,
             flags: FLAG_PUT,
+            replica_id: ReplicaId(0),
         });
     }
     let path = tmp("blockv2-restart");
@@ -207,7 +209,8 @@ fn block_v2_scan_matches_v1() {
 #[test]
 fn block_v2_future_version_fails_closed() {
     // The M1 v1 golden inputs (segment_golden.rs pins the v1 writer
-    // byte-exact) with the data-block version patched 1 → 3: with the block
+    // byte-exact) with the data-block version patched 1 → 4 (3 became a
+    // real format in SE2-M34): with the block
     // and skeleton checksums recomputed per spec (independently, via c8
     // above), open() must say Unsupported (a newer format, not damage);
     // with the stale checksums it must say Corrupt. Either way it fails
@@ -236,7 +239,7 @@ fn block_v2_future_version_fails_closed() {
 
     // Valid checksums → Unsupported.
     let mut bytes = base.clone();
-    bytes[data_off + 4..data_off + 6].copy_from_slice(&3u16.to_le_bytes());
+    bytes[data_off + 4..data_off + 6].copy_from_slice(&4u16.to_le_bytes());
     let mut sk = Vec::with_capacity(20 + payload_len);
     sk.extend_from_slice(&bytes[data_off..data_off + 20]);
     sk.extend_from_slice(&bytes[data_off + 28..data_off + 28 + payload_len]);
@@ -257,7 +260,7 @@ fn block_v2_future_version_fails_closed() {
 
     // Stale checksums → Corrupt.
     let mut bytes = base;
-    bytes[data_off + 4..data_off + 6].copy_from_slice(&3u16.to_le_bytes());
+    bytes[data_off + 4..data_off + 6].copy_from_slice(&4u16.to_le_bytes());
     let p = tmp("blockv2-future-corrupt");
     std::fs::write(&p, &bytes).unwrap();
     let err = SegmentReader::open(&p).unwrap_err();
