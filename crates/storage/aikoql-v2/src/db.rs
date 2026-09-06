@@ -592,6 +592,13 @@ impl Db {
         self.state.read().unwrap().identity.get(&oid).copied()
     }
 
+    /// SE2-M31 — the local replica of a logical id (spec §9.2): every
+    /// create reserves lid → rid 1:1, so a resolved logical always has one
+    /// local replica. The topology views delegate here.
+    pub(crate) fn resolve_local(&self, lid: LogicalId) -> Option<ReplicaId> {
+        self.state.read().unwrap().replicas.get(&lid).copied()
+    }
+
     /// Newest layer wins: active → immutables → segments (all newest
     /// first). A tombstone in a newer layer shadows an older value.
     /// SE2-M8: the Db-level read-path counters are recorded here — the

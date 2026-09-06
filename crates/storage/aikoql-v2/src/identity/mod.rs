@@ -23,6 +23,7 @@ pub mod logical_id;
 pub mod node_id;
 pub mod object_id;
 pub mod replica_id;
+pub mod topology;
 
 pub use logical_id::LogicalId;
 pub use node_id::{NodeId, LOCAL_NODE_ID};
