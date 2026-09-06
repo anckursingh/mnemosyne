@@ -37,6 +37,10 @@ use crate::identity::directory::{
 };
 use crate::identity::{LogicalId, NodeId, ObjectId, ReplicaId, LOCAL_NODE_ID};
 use crate::memtable::Memtable;
+use crate::placement::directory::{
+    load_placement_logs, merge_placement, orphan_placement_logs, placement_log_path,
+    validate_segment_location, PhysicalLocation, Placement, PlacementLog, PlacementRecord,
+};
 use crate::segment::{
     SegmentAttach, SegmentEntry, SegmentReader, SegmentWriter, FLAG_DELETE, FLAG_PUT,
 };
@@ -44,7 +48,7 @@ use crate::stats::{ReadPathStats, Stats};
 use crate::wal::{encode_frame, replay_frames, Op};
 use aikoql_kernel::knowledge::kom::sha256;
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -183,6 +187,16 @@ struct State {
     pending_replicas: Vec<ReplicaRecord>,
     next_logical_id: u64,
     next_replica_id: u64,
+    /// SE2-M32 — the placement directory (spec §34): ReplicaId →
+    /// Placement, rebuilt at open from the delta logs + the active WAL.
+    /// Every create applies Memtable placement before its ack (§14) — its
+    /// generation rides the WAL op, so replay reproduces the exact record
+    /// and the PL-005 gate stays one rule. Pending deltas publish in the
+    /// flush window; the generation allocator never decreases (stale
+    /// records are ignored, so map generations only grow).
+    placements: HashMap<ReplicaId, Placement>,
+    pending_placements: Vec<PlacementRecord>,
+    next_placement_generation: u64,
 }
 
 /// One queued batch waiting on its group: the ops plus the ack channel
@@ -288,11 +302,52 @@ impl Db {
         let cache = (config.cache_bytes > 0).then(|| BlockCache::new(config.cache_bytes));
         let stats = Arc::new(Stats::default());
         let mut segments = Vec::with_capacity(manifest.segments.len());
+        let mut readers_by_segment: HashMap<u64, Arc<SegmentReader>> = HashMap::new();
         for rec in &manifest.segments {
             let path = segment_path(&config.dir, rec.segment_id);
-            let reader = SegmentReader::open_with(&path, cache.clone(), Some(Arc::clone(&stats)))?;
-            segments.push(Arc::new(reader));
+            let reader = Arc::new(SegmentReader::open_with(
+                &path,
+                cache.clone(),
+                Some(Arc::clone(&stats)),
+            )?);
+            readers_by_segment.insert(rec.segment_id, Arc::clone(&reader));
+            segments.push(reader);
         }
+
+        // SE2-M32 — placement directory: apply every delta log ≤ CURRENT's
+        // generation (oldest first) through the structural validator — a
+        // Segment placement must name a manifest segment with an in-range
+        // block/entry, anything else fails closed. Newer orphans are
+        // reported and ignored (the §24 state-C window: the WAL still
+        // holds the ops, replay rebuilds the same records).
+        let mut placements: HashMap<ReplicaId, Placement> = HashMap::new();
+        {
+            let segment_ids: HashSet<u64> =
+                manifest.segments.iter().map(|s| s.segment_id).collect();
+            let mut validate = |loc: &PhysicalLocation| -> Result<(), FormatError> {
+                let reader = readers_by_segment.get(&loc.segment_id.0).ok_or_else(|| {
+                    FormatError::Corrupt(format!(
+                        "placement references segment {} absent from the manifest",
+                        loc.segment_id.0
+                    ))
+                })?;
+                let entries = reader.block_entry_count(loc.block_id.0);
+                validate_segment_location(loc, &segment_ids, entries)
+            };
+            for log in load_placement_logs(&config.dir, current.manifest_generation, &mut validate)?
+            {
+                for rec in &log.records {
+                    merge_placement(&mut placements, rec.rid, rec.placement)?;
+                }
+            }
+        }
+        for gen in orphan_placement_logs(&config.dir, current.manifest_generation) {
+            eprintln!(
+                "aikoql-v2: orphan placement log PLACEMENT-{gen:06}.log ignored \
+                 (generation past CURRENT)"
+            );
+        }
+        let mut pending_placements: Vec<PlacementRecord> = Vec::new();
 
         // Replay the active WAL (create it if this is the first open).
         // No append mode: on Windows FILE_APPEND_DATA handles cannot
@@ -334,7 +389,16 @@ impl Db {
                     // the next flush re-exports them, so an identity that
                     // only ever lived in a truncated WAL still lands in a
                     // log (the merge rule makes the duplicate harmless).
-                    Op::CreateObject { oid, lid, rid } => {
+                    // SE2-M32 — the placement record is the exact one the
+                    // live apply produced (its generation rides the op):
+                    // the PL-005 gate treats the replay as a duplicate of
+                    // the logged record, or stale against a newer one.
+                    Op::CreateObject {
+                        oid,
+                        lid,
+                        rid,
+                        pgen,
+                    } => {
                         merge_identity(&mut identity, *oid, *lid)?;
                         pending_identity.push(IdentityRecord {
                             oid: *oid,
@@ -345,6 +409,12 @@ impl Db {
                             lid: *lid,
                             node: LOCAL_NODE_ID,
                             rid: *rid,
+                        });
+                        let placement = Placement::Memtable { generation: *pgen };
+                        merge_placement(&mut placements, *rid, placement)?;
+                        pending_placements.push(PlacementRecord {
+                            rid: *rid,
+                            placement,
                         });
                     }
                 }
@@ -370,6 +440,15 @@ impl Db {
         // ID-014) or deletion (§49).
         let next_logical_id = identity.values().map(|l| l.0).max().unwrap_or(0) + 1;
         let next_replica_id = replicas.values().map(|r| r.0).max().unwrap_or(0) + 1;
+        // SE2-M32 — placement generations recover past the newest applied
+        // record (logs + replayed WAL); the gate ignores anything older,
+        // so the map maximum IS the maximum ever allocated.
+        let next_placement_generation = placements
+            .values()
+            .map(|p| p.generation())
+            .max()
+            .unwrap_or(0)
+            + 1;
 
         let wal = Arc::new(Mutex::new(wal));
         let state = Arc::new(RwLock::new(State {
@@ -386,6 +465,9 @@ impl Db {
             pending_replicas,
             next_logical_id,
             next_replica_id,
+            placements,
+            pending_placements,
+            next_placement_generation,
         }));
         let fsyncs = Arc::new(AtomicU64::new(0));
         let (queue_tx, committer) = if config.durability == DurabilityMode::GroupCommit {
@@ -461,7 +543,12 @@ impl Db {
                 // (acked == durable AND visible, the M6 rule): the maps
                 // hold it immediately and the pending records ride the
                 // next flush publication.
-                Op::CreateObject { oid, lid, rid } => {
+                Op::CreateObject {
+                    oid,
+                    lid,
+                    rid,
+                    pgen,
+                } => {
                     merge_identity(&mut state.identity, *oid, *lid)?;
                     state.pending_identity.push(IdentityRecord {
                         oid: *oid,
@@ -472,6 +559,14 @@ impl Db {
                         lid: *lid,
                         node: LOCAL_NODE_ID,
                         rid: *rid,
+                    });
+                    // SE2-M32 — §14: physical placement initially = the
+                    // memtable, at the generation reserved in the op.
+                    let placement = Placement::Memtable { generation: *pgen };
+                    merge_placement(&mut state.placements, *rid, placement)?;
+                    state.pending_placements.push(PlacementRecord {
+                        rid: *rid,
+                        placement,
                     });
                 }
             }
@@ -574,11 +669,21 @@ impl Db {
             state.next_logical_id += 1;
             let rid = ReplicaId(state.next_replica_id);
             state.next_replica_id += 1;
+            let pgen = state.next_placement_generation;
+            state.next_placement_generation += 1;
             let digest = sha256(&lid.to_bytes());
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(&digest[..16]);
             let oid = ObjectId(bytes);
-            (Op::CreateObject { oid, lid, rid }, oid)
+            (
+                Op::CreateObject {
+                    oid,
+                    lid,
+                    rid,
+                    pgen,
+                },
+                oid,
+            )
         };
         self.write(&[op])?;
         Ok(oid)
@@ -597,6 +702,13 @@ impl Db {
     /// local replica. The topology views delegate here.
     pub(crate) fn resolve_local(&self, lid: LogicalId) -> Option<ReplicaId> {
         self.state.read().unwrap().replicas.get(&lid).copied()
+    }
+
+    /// SE2-M32 — the placement of a local replica (spec §9.3): created
+    /// replicas carry Memtable placement from birth (§14); flush and
+    /// compaction move it. The resolver view delegates here.
+    pub(crate) fn resolve_placement(&self, rid: ReplicaId) -> Option<Placement> {
+        self.state.read().unwrap().placements.get(&rid).copied()
     }
 
     /// Newest layer wins: active → immutables → segments (all newest
@@ -989,13 +1101,13 @@ impl Db {
             new_segments.push(Arc::new(reader));
         }
         state.generation += 1;
-        // SE2-M30 — the pending identity/replica deltas publish in the
-        // SAME window as the segments they accompany, before the manifest
-        // names the generation (the §23 order): a crash before CURRENT
-        // leaves orphan logs + the full WAL (replay rebuilds — the merge
-        // rule is idempotent), a crash after CURRENT re-applies identical
-        // records from both. A generation with no identity work publishes
-        // no log — gaps are normal.
+        // SE2-M30/M32 — the pending identity/replica/placement deltas
+        // publish in the SAME window as the segments they accompany,
+        // before the manifest names the generation (the §23 order): a
+        // crash before CURRENT leaves orphan logs + the full WAL (replay
+        // rebuilds — the merge rules are idempotent), a crash after
+        // CURRENT re-applies identical records from both. A generation
+        // with no directory work publishes no log — gaps are normal.
         if !state.pending_identity.is_empty() {
             let log = IdentityLog {
                 format_version: FORMAT_VERSION,
@@ -1011,6 +1123,14 @@ impl Db {
                 records: std::mem::take(&mut state.pending_replicas),
             };
             ReplicaLog::publish(&replica_log_path(&config.dir, state.generation), &log)?;
+        }
+        if !state.pending_placements.is_empty() {
+            let log = PlacementLog {
+                format_version: FORMAT_VERSION,
+                generation: state.generation,
+                records: std::mem::take(&mut state.pending_placements),
+            };
+            PlacementLog::publish(&placement_log_path(&config.dir, state.generation), &log)?;
         }
         crash_park("AIKOQL_V2_FLUSH_PARK", &config.dir, "after_identity");
         let manifest = Manifest {
@@ -1267,9 +1387,9 @@ fn batch_bytes_of(b: &Batch) -> usize {
         .map(|op| match op {
             Op::Put(k, v) => k.len() + v.len(),
             Op::Delete(k) => k.len(),
-            // SE2-M30 — the fixed payload width (oid 16 + lid 8 + rid 8),
-            // for the group-cap accounting.
-            Op::CreateObject { .. } => 32,
+            // SE2-M30/M32 — the fixed payload width (oid 16 + lid 8 +
+            // rid 8 + pgen 8), for the group-cap accounting.
+            Op::CreateObject { .. } => 40,
         })
         .sum()
 }
@@ -1432,7 +1552,12 @@ fn commit_group(
                     // SE2-M30 — the same apply as Sync's write(): the ids
                     // were reserved at submit time, so the committer just
                     // merges and pends them (acked == visible).
-                    Op::CreateObject { oid, lid, rid } => {
+                    Op::CreateObject {
+                        oid,
+                        lid,
+                        rid,
+                        pgen,
+                    } => {
                         if let Err(e) = merge_identity(&mut st.identity, *oid, *lid) {
                             outcome = Err(e);
                             break;
@@ -1449,6 +1574,17 @@ fn commit_group(
                             lid: *lid,
                             node: LOCAL_NODE_ID,
                             rid: *rid,
+                        });
+                        // SE2-M32 — the placement applies and pends with
+                        // the identity (acked == visible, the M6 rule).
+                        let placement = Placement::Memtable { generation: *pgen };
+                        if let Err(e) = merge_placement(&mut st.placements, *rid, placement) {
+                            outcome = Err(e);
+                            break;
+                        }
+                        st.pending_placements.push(PlacementRecord {
+                            rid: *rid,
+                            placement,
                         });
                     }
                 }

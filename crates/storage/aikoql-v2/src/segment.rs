@@ -810,6 +810,12 @@ impl SegmentReader {
         self.block_count
     }
 
+    /// SE2-M32 — per-block entry count for placement validation (the
+    /// §34 structural check: block/entry within range at recovery).
+    pub(crate) fn block_entry_count(&self, block_id: u32) -> Option<u32> {
+        self.data.get(block_id as usize).map(|b| b.entries)
+    }
+
     pub fn key_min(&self) -> &[u8] {
         &self.key_min
     }

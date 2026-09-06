@@ -1,8 +1,16 @@
-//! SE2-M29 — placement identifiers (spec §28.1): SegmentId and BlockId are
-//! strong newtypes, never bare u64/u32 — physical placement identifiers
+//! SE2-M29/M32 — placement identifiers (spec §28.1): SegmentId and BlockId
+//! are strong newtypes, never bare u64/u32 — physical placement identifiers
 //! must not be substitutable for identity types or for each other. The
-//! Placement / PhysicalLocation types (spec §7, §34 — the mutable layer
-//! below the identity hierarchy) land in SE2-M32.
+//! placement directory (the mutable layer below the identity hierarchy,
+//! spec §34) lives in [`directory`].
+
+pub mod directory;
+
+pub use directory::{
+    merge_placement, orphan_placement_logs, placement_log_path, validate_segment_location,
+    ApplyOutcome, LocalPlacementResolver, PhysicalLocation, Placement, PlacementDirectory,
+    PlacementLog, PlacementRecord, PlacementResolver,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SegmentId(pub u64);

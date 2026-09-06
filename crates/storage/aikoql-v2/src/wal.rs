@@ -27,7 +27,11 @@ pub const OP_PUT: u8 = 1;
 pub const OP_DELETE: u8 = 2;
 /// SE2-M30 — allocate a new object identity (spec §14): the frame carries
 /// the (ObjectId, LogicalId, ReplicaId) triple; replay and the live apply
-/// both rebuild the identity directories from it.
+/// both rebuild the identity directories from it. SE2-M32 — plus the
+/// placement generation: the op is self-describing, so a replayed create
+/// reproduces the EXACT placement record the live apply produced (the
+/// merge gate needs it — a re-derived generation would regress a flushed
+/// Segment placement back to Memtable in the §24 state-D window).
 pub const OP_CREATE_OBJECT: u8 = 3;
 
 const WAL_MAGIC: &[u8; 4] = b"AKWF";
@@ -37,12 +41,15 @@ const FRAME_HEADER_LEN: usize = 19; // magic 4 + version 2 + type 1 + seq 8 + pa
 pub enum Op {
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
-    /// `oid 16 | lid 8 | rid 8` after the op byte — fixed width, no
-    /// length prefixes (a CreateObject has no key or value).
+    /// `oid 16 | lid 8 | rid 8 | pgen 8` after the op byte — fixed width,
+    /// no length prefixes (a CreateObject has no key or value). `pgen` is
+    /// the placement generation the live apply assigned (SE2-M32), so
+    /// replay reproduces the exact placement record.
     CreateObject {
         oid: ObjectId,
         lid: LogicalId,
         rid: ReplicaId,
+        pgen: u64,
     },
 }
 
@@ -81,11 +88,17 @@ pub fn encode_frame(seq: u64, ops: &[Op]) -> Result<Vec<u8>, FormatError> {
                 payload.extend_from_slice(&(k.len() as u32).to_le_bytes());
                 payload.extend_from_slice(k);
             }
-            Op::CreateObject { oid, lid, rid } => {
+            Op::CreateObject {
+                oid,
+                lid,
+                rid,
+                pgen,
+            } => {
                 payload.push(OP_CREATE_OBJECT);
                 payload.extend_from_slice(oid.as_bytes());
                 payload.extend_from_slice(&lid.to_bytes());
                 payload.extend_from_slice(&rid.to_bytes());
+                payload.extend_from_slice(&pgen.to_le_bytes());
             }
         }
     }
@@ -153,7 +166,13 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(WalFrame, usize), FormatError> {
                 let oid = ObjectId::from_bytes(pcur.take(16)?.try_into().expect("16-byte slice"));
                 let lid = LogicalId::from_bytes(pcur.take(8)?.try_into().expect("8-byte slice"));
                 let rid = ReplicaId::from_bytes(pcur.take(8)?.try_into().expect("8-byte slice"));
-                ops.push(Op::CreateObject { oid, lid, rid });
+                let pgen = pcur.u64()?;
+                ops.push(Op::CreateObject {
+                    oid,
+                    lid,
+                    rid,
+                    pgen,
+                });
             }
             other => {
                 return Err(FormatError::Unsupported(format!("WAL op byte {other}")));
