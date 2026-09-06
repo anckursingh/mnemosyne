@@ -31,12 +31,18 @@
 use crate::cache::{BlockCache, CacheStats};
 use crate::compaction::{merge, CompactStats, KeepAll, RetentionPolicy};
 use crate::format::{verify_pair, Current, FormatError, Manifest, SegmentRecord, FORMAT_VERSION};
+use crate::identity::directory::{
+    identity_log_path, load_identity_logs, load_replica_logs, orphan_identity_logs,
+    orphan_replica_logs, replica_log_path, IdentityLog, IdentityRecord, ReplicaLog, ReplicaRecord,
+};
+use crate::identity::{LogicalId, NodeId, ObjectId, ReplicaId, LOCAL_NODE_ID};
 use crate::memtable::Memtable;
 use crate::segment::{
     SegmentAttach, SegmentEntry, SegmentReader, SegmentWriter, FLAG_DELETE, FLAG_PUT,
 };
 use crate::stats::{ReadPathStats, Stats};
 use crate::wal::{encode_frame, replay_frames, Op};
+use aikoql_kernel::knowledge::kom::sha256;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -163,6 +169,20 @@ struct State {
     next_seq: u64,
     next_segment_id: u64,
     generation: u64,
+    /// SE2-M30 — identity/replica directories (spec §8.1/§8.2): the
+    /// ObjectId → LogicalId and LogicalId → ReplicaId maps (rebuilt at
+    /// open from the delta logs + the active WAL; every create applies
+    /// before its ack), the pending delta records the next flush
+    /// publishes in its publication window, and the monotonic allocators.
+    /// The allocators never decrease — deleted ids are never reused
+    /// (§16/§49); a crash between reservation and commit leaves a gap,
+    /// which is not reuse.
+    identity: HashMap<ObjectId, LogicalId>,
+    replicas: HashMap<LogicalId, ReplicaId>,
+    pending_identity: Vec<IdentityRecord>,
+    pending_replicas: Vec<ReplicaRecord>,
+    next_logical_id: u64,
+    next_replica_id: u64,
 }
 
 /// One queued batch waiting on its group: the ops plus the ack channel
@@ -227,6 +247,39 @@ impl Db {
             eprintln!("aikoql-v2: orphan segment SEGMENT-{id:06}.seg ignored (not in manifest)");
         }
 
+        // SE2-M30 — identity/replica directories: apply every delta log at
+        // or below CURRENT's generation (oldest first) — a damaged one
+        // fails closed, identity state is unrecoverable without it — and
+        // report-and-ignore newer orphans (a crash between log publish and
+        // CURRENT, the §24 state-C window: the WAL still holds the frames,
+        // so replay rebuilds the same records).
+        let mut identity: HashMap<ObjectId, LogicalId> = HashMap::new();
+        let mut replicas: HashMap<LogicalId, ReplicaId> = HashMap::new();
+        for log in load_identity_logs(&config.dir, current.manifest_generation)? {
+            for rec in &log.records {
+                merge_identity(&mut identity, rec.oid, rec.lid)?;
+            }
+        }
+        for log in load_replica_logs(&config.dir, current.manifest_generation)? {
+            for rec in &log.records {
+                merge_replica(&mut replicas, rec.lid, rec.node, rec.rid)?;
+            }
+        }
+        for gen in orphan_identity_logs(&config.dir, current.manifest_generation) {
+            eprintln!(
+                "aikoql-v2: orphan identity log IDENTITY-{gen:06}.log ignored \
+                 (generation past CURRENT)"
+            );
+        }
+        for gen in orphan_replica_logs(&config.dir, current.manifest_generation) {
+            eprintln!(
+                "aikoql-v2: orphan replica log REPLICA-{gen:06}.log ignored \
+                 (generation past CURRENT)"
+            );
+        }
+        let mut pending_identity: Vec<IdentityRecord> = Vec::new();
+        let mut pending_replicas: Vec<ReplicaRecord> = Vec::new();
+
         // Referenced segments must open (fail closed on missing/corrupt).
         // SE2-M7: when the block cache is on, every reader the Db opens
         // shares it (reopened segments get a fresh identity — the cache is
@@ -277,6 +330,23 @@ impl Db {
                 match op {
                     Op::Put(k, v) => active.apply(k.clone(), frame.seq, Some(v.clone())),
                     Op::Delete(k) => active.apply(k.clone(), frame.seq, None),
+                    // SE2-M30 — a replayed create re-pends its records:
+                    // the next flush re-exports them, so an identity that
+                    // only ever lived in a truncated WAL still lands in a
+                    // log (the merge rule makes the duplicate harmless).
+                    Op::CreateObject { oid, lid, rid } => {
+                        merge_identity(&mut identity, *oid, *lid)?;
+                        pending_identity.push(IdentityRecord {
+                            oid: *oid,
+                            lid: *lid,
+                        });
+                        merge_replica(&mut replicas, *lid, LOCAL_NODE_ID, *rid)?;
+                        pending_replicas.push(ReplicaRecord {
+                            lid: *lid,
+                            node: LOCAL_NODE_ID,
+                            rid: *rid,
+                        });
+                    }
                 }
             }
             replay_max = replay_max.max(frame.seq);
@@ -295,6 +365,11 @@ impl Db {
             .max()
             .unwrap_or(0)
             + 1;
+        // SE2-M30 — the allocators recover past every id that ever existed
+        // (logs + replayed WAL): ids are never reused after restart (§32
+        // ID-014) or deletion (§49).
+        let next_logical_id = identity.values().map(|l| l.0).max().unwrap_or(0) + 1;
+        let next_replica_id = replicas.values().map(|r| r.0).max().unwrap_or(0) + 1;
 
         let wal = Arc::new(Mutex::new(wal));
         let state = Arc::new(RwLock::new(State {
@@ -305,6 +380,12 @@ impl Db {
             next_seq,
             next_segment_id,
             generation: manifest.generation,
+            identity,
+            replicas,
+            pending_identity,
+            pending_replicas,
+            next_logical_id,
+            next_replica_id,
         }));
         let fsyncs = Arc::new(AtomicU64::new(0));
         let (queue_tx, committer) = if config.durability == DurabilityMode::GroupCommit {
@@ -376,6 +457,23 @@ impl Db {
             match op {
                 Op::Put(k, v) => state.active.apply(k.clone(), seq, Some(v.clone())),
                 Op::Delete(k) => state.active.apply(k.clone(), seq, None),
+                // SE2-M30 — a create applies its identity BEFORE the ack
+                // (acked == durable AND visible, the M6 rule): the maps
+                // hold it immediately and the pending records ride the
+                // next flush publication.
+                Op::CreateObject { oid, lid, rid } => {
+                    merge_identity(&mut state.identity, *oid, *lid)?;
+                    state.pending_identity.push(IdentityRecord {
+                        oid: *oid,
+                        lid: *lid,
+                    });
+                    merge_replica(&mut state.replicas, *lid, LOCAL_NODE_ID, *rid)?;
+                    state.pending_replicas.push(ReplicaRecord {
+                        lid: *lid,
+                        node: LOCAL_NODE_ID,
+                        rid: *rid,
+                    });
+                }
             }
         }
         if state.active.bytes() >= self.config.memtable_bytes {
@@ -456,6 +554,42 @@ impl Db {
 
     pub fn delete(&self, key: &[u8]) -> Result<u64, FormatError> {
         self.write(&[Op::Delete(key.to_vec())])
+    }
+
+    /// SE2-M30 — allocate a new object identity (spec §14 write path,
+    /// first half): ObjectId → LogicalId → ReplicaId in ONE WAL frame,
+    /// durable per the durability mode, resolvable immediately after the
+    /// ack. The ids are reserved under the state lock before the write
+    /// commits, so concurrent creates never collide; a crash between
+    /// reservation and commit leaves a gap, which is not reuse (§16/§49 —
+    /// the allocators only advance). ObjectId = sha256(lid.to_le_bytes())
+    /// [..16] — unique by the lid reservation, and batch-safe where a
+    /// seq-derived id would collide for two creates in one batch; §6.1's
+    /// future distributed generation = a documented per-node/instance
+    /// salt.
+    pub fn create_object(&self) -> Result<ObjectId, FormatError> {
+        let (op, oid) = {
+            let mut state = self.state.write().unwrap();
+            let lid = LogicalId(state.next_logical_id);
+            state.next_logical_id += 1;
+            let rid = ReplicaId(state.next_replica_id);
+            state.next_replica_id += 1;
+            let digest = sha256(&lid.to_bytes());
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            let oid = ObjectId(bytes);
+            (Op::CreateObject { oid, lid, rid }, oid)
+        };
+        self.write(&[op])?;
+        Ok(oid)
+    }
+
+    /// SE2-M30 — ObjectId → LogicalId (spec §9.1, the Db-level surface;
+    /// the resolver abstractions wrap this in SE2-M31). In-memory: the
+    /// maps are rebuilt at open from the delta logs + the active WAL, and
+    /// every create applies before its ack.
+    pub fn resolve_object(&self, oid: ObjectId) -> Option<LogicalId> {
+        self.state.read().unwrap().identity.get(&oid).copied()
     }
 
     /// Newest layer wins: active → immutables → segments (all newest
@@ -848,6 +982,30 @@ impl Db {
             new_segments.push(Arc::new(reader));
         }
         state.generation += 1;
+        // SE2-M30 — the pending identity/replica deltas publish in the
+        // SAME window as the segments they accompany, before the manifest
+        // names the generation (the §23 order): a crash before CURRENT
+        // leaves orphan logs + the full WAL (replay rebuilds — the merge
+        // rule is idempotent), a crash after CURRENT re-applies identical
+        // records from both. A generation with no identity work publishes
+        // no log — gaps are normal.
+        if !state.pending_identity.is_empty() {
+            let log = IdentityLog {
+                format_version: FORMAT_VERSION,
+                generation: state.generation,
+                records: std::mem::take(&mut state.pending_identity),
+            };
+            IdentityLog::publish(&identity_log_path(&config.dir, state.generation), &log)?;
+        }
+        if !state.pending_replicas.is_empty() {
+            let log = ReplicaLog {
+                format_version: FORMAT_VERSION,
+                generation: state.generation,
+                records: std::mem::take(&mut state.pending_replicas),
+            };
+            ReplicaLog::publish(&replica_log_path(&config.dir, state.generation), &log)?;
+        }
+        crash_park("AIKOQL_V2_FLUSH_PARK", &config.dir, "after_identity");
         let manifest = Manifest {
             format_version: FORMAT_VERSION,
             generation: state.generation,
@@ -1102,8 +1260,64 @@ fn batch_bytes_of(b: &Batch) -> usize {
         .map(|op| match op {
             Op::Put(k, v) => k.len() + v.len(),
             Op::Delete(k) => k.len(),
+            // SE2-M30 — the fixed payload width (oid 16 + lid 8 + rid 8),
+            // for the group-cap accounting.
+            Op::CreateObject { .. } => 32,
         })
         .sum()
+}
+
+/// SE2-M30 — the identity/replica merge rule (§24 crash windows): an
+/// identical repeat (a crash after CURRENT but before WAL truncation —
+/// the record arrives from both the log and the replay) is a no-op; a
+/// CONFLICTING repeat (same ObjectId, different LogicalId) fails closed —
+/// exactly one authoritative mapping, never two.
+fn merge_identity(
+    identity: &mut HashMap<ObjectId, LogicalId>,
+    oid: ObjectId,
+    lid: LogicalId,
+) -> Result<(), FormatError> {
+    match identity.entry(oid) {
+        std::collections::hash_map::Entry::Occupied(e) if *e.get() == lid => Ok(()),
+        std::collections::hash_map::Entry::Occupied(e) => Err(FormatError::Corrupt(format!(
+            "identity directory: ObjectId {oid} maps to both {} and {}",
+            e.get().0,
+            lid.0
+        ))),
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert(lid);
+            Ok(())
+        }
+    }
+}
+
+/// SE2-M30 — the replica merge rule (same §24 shape, keyed by LogicalId).
+/// The MVP is single-node: a record naming any other node comes from a
+/// topology this build cannot place — fail closed (the M9 policy).
+fn merge_replica(
+    replicas: &mut HashMap<LogicalId, ReplicaId>,
+    lid: LogicalId,
+    node: NodeId,
+    rid: ReplicaId,
+) -> Result<(), FormatError> {
+    if node != LOCAL_NODE_ID {
+        return Err(FormatError::Corrupt(format!(
+            "replica directory: record names {node:?}, this build only knows {LOCAL_NODE_ID:?}"
+        )));
+    }
+    match replicas.entry(lid) {
+        std::collections::hash_map::Entry::Occupied(e) if *e.get() == rid => Ok(()),
+        std::collections::hash_map::Entry::Occupied(e) => Err(FormatError::Corrupt(format!(
+            "replica directory: LogicalId {} maps to both {} and {}",
+            e.key().0,
+            e.get().0,
+            rid.0
+        ))),
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert(rid);
+            Ok(())
+        }
+    }
 }
 
 /// The committer: drain the queue into groups bounded by the caps and
@@ -1208,10 +1422,32 @@ fn commit_group(
                 match op {
                     Op::Put(k, v) => st.active.apply(k.clone(), *seq, Some(v.clone())),
                     Op::Delete(k) => st.active.apply(k.clone(), *seq, None),
+                    // SE2-M30 — the same apply as Sync's write(): the ids
+                    // were reserved at submit time, so the committer just
+                    // merges and pends them (acked == visible).
+                    Op::CreateObject { oid, lid, rid } => {
+                        if let Err(e) = merge_identity(&mut st.identity, *oid, *lid) {
+                            outcome = Err(e);
+                            break;
+                        }
+                        st.pending_identity.push(IdentityRecord {
+                            oid: *oid,
+                            lid: *lid,
+                        });
+                        if let Err(e) = merge_replica(&mut st.replicas, *lid, LOCAL_NODE_ID, *rid) {
+                            outcome = Err(e);
+                            break;
+                        }
+                        st.pending_replicas.push(ReplicaRecord {
+                            lid: *lid,
+                            node: LOCAL_NODE_ID,
+                            rid: *rid,
+                        });
+                    }
                 }
             }
         }
-        if st.active.bytes() >= config.memtable_bytes {
+        if outcome.is_ok() && st.active.bytes() >= config.memtable_bytes {
             if let Err(e) = Db::flush_locked_impl(config, wal, &mut st, cache, stats) {
                 outcome = Err(e);
             }

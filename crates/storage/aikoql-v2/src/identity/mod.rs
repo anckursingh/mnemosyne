@@ -18,6 +18,7 @@
 //! accepts_replica(logical);
 //! ```
 
+pub mod directory;
 pub mod logical_id;
 pub mod node_id;
 pub mod object_id;

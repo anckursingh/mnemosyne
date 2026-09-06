@@ -137,6 +137,10 @@ fn apply_and_verify(
         match op {
             Op::Put(..) => *puts += 1,
             Op::Delete(..) => *deletes += 1,
+            // SE2-M30 — v1 WAL frames cannot carry op 3 (the decode
+            // rejects it), so this arm is unreachable; it exists for the
+            // exhaustive match only.
+            Op::CreateObject { .. } => {}
         }
     }
     db.write(ops)?;
@@ -145,6 +149,7 @@ fn apply_and_verify(
         let (key, want) = match op {
             Op::Put(k, v) => (&k[..], Some(&v[..])),
             Op::Delete(k) => (&k[..], None),
+            Op::CreateObject { .. } => continue, // no key to verify (v1 frames)
         };
         if !seen.insert(key) {
             continue; // overwritten by a later op in this frame

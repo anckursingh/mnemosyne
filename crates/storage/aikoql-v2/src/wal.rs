@@ -19,11 +19,16 @@
 //! damage followed by a valid frame fails closed.
 
 use crate::format::{checksum8, Cursor, FormatError};
+use crate::identity::{LogicalId, ObjectId, ReplicaId};
 
 pub const WAL_FORMAT_VERSION: u16 = 1;
 pub const FRAME_BATCH: u8 = 1;
 pub const OP_PUT: u8 = 1;
 pub const OP_DELETE: u8 = 2;
+/// SE2-M30 — allocate a new object identity (spec §14): the frame carries
+/// the (ObjectId, LogicalId, ReplicaId) triple; replay and the live apply
+/// both rebuild the identity directories from it.
+pub const OP_CREATE_OBJECT: u8 = 3;
 
 const WAL_MAGIC: &[u8; 4] = b"AKWF";
 const FRAME_HEADER_LEN: usize = 19; // magic 4 + version 2 + type 1 + seq 8 + payload_len 4
@@ -32,12 +37,20 @@ const FRAME_HEADER_LEN: usize = 19; // magic 4 + version 2 + type 1 + seq 8 + pa
 pub enum Op {
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
+    /// `oid 16 | lid 8 | rid 8` after the op byte — fixed width, no
+    /// length prefixes (a CreateObject has no key or value).
+    CreateObject {
+        oid: ObjectId,
+        lid: LogicalId,
+        rid: ReplicaId,
+    },
 }
 
 impl Op {
     pub fn key(&self) -> &[u8] {
         match self {
             Op::Put(k, _) | Op::Delete(k) => k,
+            Op::CreateObject { .. } => &[],
         }
     }
 }
@@ -67,6 +80,12 @@ pub fn encode_frame(seq: u64, ops: &[Op]) -> Result<Vec<u8>, FormatError> {
                 payload.push(OP_DELETE);
                 payload.extend_from_slice(&(k.len() as u32).to_le_bytes());
                 payload.extend_from_slice(k);
+            }
+            Op::CreateObject { oid, lid, rid } => {
+                payload.push(OP_CREATE_OBJECT);
+                payload.extend_from_slice(oid.as_bytes());
+                payload.extend_from_slice(&lid.to_bytes());
+                payload.extend_from_slice(&rid.to_bytes());
             }
         }
     }
@@ -120,13 +139,22 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(WalFrame, usize), FormatError> {
     let mut ops = Vec::with_capacity(count);
     for _ in 0..count {
         let op = pcur.u8()?;
-        let key = pcur.vec()?;
         match op {
             OP_PUT => {
+                let key = pcur.vec()?;
                 let value = pcur.vec()?;
                 ops.push(Op::Put(key, value));
             }
-            OP_DELETE => ops.push(Op::Delete(key)),
+            OP_DELETE => {
+                let key = pcur.vec()?;
+                ops.push(Op::Delete(key));
+            }
+            OP_CREATE_OBJECT => {
+                let oid = ObjectId::from_bytes(pcur.take(16)?.try_into().expect("16-byte slice"));
+                let lid = LogicalId::from_bytes(pcur.take(8)?.try_into().expect("8-byte slice"));
+                let rid = ReplicaId::from_bytes(pcur.take(8)?.try_into().expect("8-byte slice"));
+                ops.push(Op::CreateObject { oid, lid, rid });
+            }
             other => {
                 return Err(FormatError::Unsupported(format!("WAL op byte {other}")));
             }

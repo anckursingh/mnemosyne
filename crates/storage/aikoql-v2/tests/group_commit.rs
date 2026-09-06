@@ -25,6 +25,7 @@ fn batch_bytes(ops: &[Op]) -> usize {
         .map(|op| match op {
             Op::Put(k, v) => k.len() + v.len(),
             Op::Delete(k) => k.len(),
+            Op::CreateObject { .. } => 32, // oid 16 + lid 8 + rid 8
         })
         .sum()
 }
