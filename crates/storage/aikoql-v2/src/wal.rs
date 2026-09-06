@@ -33,6 +33,12 @@ pub const OP_DELETE: u8 = 2;
 /// merge gate needs it — a re-derived generation would regress a flushed
 /// Segment placement back to Memtable in the §24 state-D window).
 pub const OP_CREATE_OBJECT: u8 = 3;
+/// SE2-M33 — an object put/delete carries the ReplicaId (spec §17/§18: rid
+/// is the persisted relocation handle), so replay restores the memtable
+/// entry's identity without consulting the directory maps. Payload after
+/// the op byte: `rid u64 | key_len u32 | key | (value_len u32 | value)`.
+pub const OP_PUT_OBJECT: u8 = 4;
+pub const OP_DELETE_OBJECT: u8 = 5;
 
 const WAL_MAGIC: &[u8; 4] = b"AKWF";
 const FRAME_HEADER_LEN: usize = 19; // magic 4 + version 2 + type 1 + seq 8 + payload_len 4
@@ -51,12 +57,19 @@ pub enum Op {
         rid: ReplicaId,
         pgen: u64,
     },
+    /// SE2-M33 — write a value under the object's own ReplicaId (§14 write
+    /// path): the memtable entry carries the rid, the identity read path
+    /// filters on it.
+    PutObject(ReplicaId, Vec<u8>, Vec<u8>),
+    /// SE2-M33 — tombstone carrying the owning rid (§16): identity
+    /// metadata survives the delete.
+    DeleteObject(ReplicaId, Vec<u8>),
 }
 
 impl Op {
     pub fn key(&self) -> &[u8] {
         match self {
-            Op::Put(k, _) | Op::Delete(k) => k,
+            Op::Put(k, _) | Op::Delete(k) | Op::PutObject(_, k, _) | Op::DeleteObject(_, k) => k,
             Op::CreateObject { .. } => &[],
         }
     }
@@ -99,6 +112,20 @@ pub fn encode_frame(seq: u64, ops: &[Op]) -> Result<Vec<u8>, FormatError> {
                 payload.extend_from_slice(&lid.to_bytes());
                 payload.extend_from_slice(&rid.to_bytes());
                 payload.extend_from_slice(&pgen.to_le_bytes());
+            }
+            Op::PutObject(rid, k, v) => {
+                payload.push(OP_PUT_OBJECT);
+                payload.extend_from_slice(&rid.to_bytes());
+                payload.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                payload.extend_from_slice(k);
+                payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                payload.extend_from_slice(v);
+            }
+            Op::DeleteObject(rid, k) => {
+                payload.push(OP_DELETE_OBJECT);
+                payload.extend_from_slice(&rid.to_bytes());
+                payload.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                payload.extend_from_slice(k);
             }
         }
     }
@@ -173,6 +200,17 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(WalFrame, usize), FormatError> {
                     rid,
                     pgen,
                 });
+            }
+            OP_PUT_OBJECT => {
+                let rid = ReplicaId::from_bytes(pcur.take(8)?.try_into().expect("8-byte slice"));
+                let key = pcur.vec()?;
+                let value = pcur.vec()?;
+                ops.push(Op::PutObject(rid, key, value));
+            }
+            OP_DELETE_OBJECT => {
+                let rid = ReplicaId::from_bytes(pcur.take(8)?.try_into().expect("8-byte slice"));
+                let key = pcur.vec()?;
+                ops.push(Op::DeleteObject(rid, key));
             }
             other => {
                 return Err(FormatError::Unsupported(format!("WAL op byte {other}")));

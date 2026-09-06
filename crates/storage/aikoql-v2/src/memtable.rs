@@ -3,6 +3,7 @@
 //! for a key is its highest-seq entry; a None value is a delete tombstone.
 //! The byte accounting is approximate (reported, never asserted).
 
+use crate::identity::ReplicaId;
 use std::collections::BTreeMap;
 
 /// Approximate in-memory cost of one entry: key + value + seq + map node.
@@ -12,6 +13,11 @@ const ENTRY_OVERHEAD: usize = 24;
 pub struct MemEntry {
     /// None = delete tombstone.
     pub value: Option<Vec<u8>>,
+    /// SE2-M33 — the owning replica (0 = byte API). The identity read path
+    /// filters on it (§17/§18: rid is the persisted relocation handle, the
+    /// entry carries exactly that — the oid→lid map stays in the
+    /// directory).
+    pub replica_id: ReplicaId,
 }
 
 #[derive(Debug, Default)]
@@ -35,7 +41,27 @@ impl Memtable {
 
     pub fn apply(&mut self, key: Vec<u8>, seq: u64, value: Option<Vec<u8>>) {
         self.bytes += key.len() + value.as_ref().map_or(0, Vec::len) + ENTRY_OVERHEAD;
-        self.map.insert((key, seq), MemEntry { value });
+        self.map.insert(
+            (key, seq),
+            MemEntry {
+                value,
+                replica_id: ReplicaId(0),
+            },
+        );
+    }
+
+    /// SE2-M33 — an object write: the entry carries the owning replica id
+    /// (the §17 target shape), so the identity read path can filter the
+    /// object's own entries out of the key's run.
+    pub fn apply_object(
+        &mut self,
+        key: Vec<u8>,
+        seq: u64,
+        value: Option<Vec<u8>>,
+        replica_id: ReplicaId,
+    ) {
+        self.bytes += key.len() + value.as_ref().map_or(0, Vec::len) + ENTRY_OVERHEAD;
+        self.map.insert((key, seq), MemEntry { value, replica_id });
     }
 
     /// Head for a key: the highest-seq entry (BTreeMap order is key asc,
@@ -49,6 +75,19 @@ impl Memtable {
             .range((key.to_vec(), 0)..)
             .take_while(|((k, _), _)| k.as_slice() == key)
             .map(|(_, e)| e)
+            .last()
+    }
+
+    /// SE2-M33 — the object's head: the newest entry in the key's run whose
+    /// replica_id matches (the run is seq-ascending, so the last match is
+    /// the head). Entries of other replicas — 0 = byte API included — are
+    /// another layer's rows (§11) and never answer an object read.
+    pub fn get_by_rid(&self, key: &[u8], rid: ReplicaId) -> Option<&MemEntry> {
+        self.map
+            .range((key.to_vec(), 0)..)
+            .take_while(|((k, _), _)| k.as_slice() == key)
+            .map(|(_, e)| e)
+            .filter(|e| e.replica_id == rid)
             .last()
     }
 

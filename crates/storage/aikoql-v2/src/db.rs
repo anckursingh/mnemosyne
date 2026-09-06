@@ -33,8 +33,10 @@ use crate::compaction::{merge, CompactStats, KeepAll, RetentionPolicy};
 use crate::format::{verify_pair, Current, FormatError, Manifest, SegmentRecord, FORMAT_VERSION};
 use crate::identity::directory::{
     identity_log_path, load_identity_logs, load_replica_logs, orphan_identity_logs,
-    orphan_replica_logs, replica_log_path, IdentityLog, IdentityRecord, ReplicaLog, ReplicaRecord,
+    orphan_replica_logs, replica_log_path, IdentityLog, IdentityRecord, IdentityResolver,
+    LocalIdentityDirectory, ReplicaLog, ReplicaRecord,
 };
+use crate::identity::topology::{LocalReplicaDirectory, ReplicaDirectory};
 use crate::identity::{LogicalId, NodeId, ObjectId, ReplicaId, LOCAL_NODE_ID};
 use crate::memtable::Memtable;
 use crate::placement::directory::{
@@ -385,6 +387,15 @@ impl Db {
                 match op {
                     Op::Put(k, v) => active.apply(k.clone(), frame.seq, Some(v.clone())),
                     Op::Delete(k) => active.apply(k.clone(), frame.seq, None),
+                    // SE2-M33 — the rid rides the op (spec §17/§18), so
+                    // replay restores the entry's identity without
+                    // consulting the directories.
+                    Op::PutObject(rid, k, v) => {
+                        active.apply_object(k.clone(), frame.seq, Some(v.clone()), *rid)
+                    }
+                    Op::DeleteObject(rid, k) => {
+                        active.apply_object(k.clone(), frame.seq, None, *rid)
+                    }
                     // SE2-M30 — a replayed create re-pends its records:
                     // the next flush re-exports them, so an identity that
                     // only ever lived in a truncated WAL still lands in a
@@ -539,6 +550,15 @@ impl Db {
             match op {
                 Op::Put(k, v) => state.active.apply(k.clone(), seq, Some(v.clone())),
                 Op::Delete(k) => state.active.apply(k.clone(), seq, None),
+                // SE2-M33 — the object ops apply exactly like the byte ops;
+                // the rid rides the op, the identity maps already hold the
+                // create (acked == visible, the M6 rule).
+                Op::PutObject(rid, k, v) => {
+                    state
+                        .active
+                        .apply_object(k.clone(), seq, Some(v.clone()), *rid)
+                }
+                Op::DeleteObject(rid, k) => state.active.apply_object(k.clone(), seq, None, *rid),
                 // SE2-M30 — a create applies its identity BEFORE the ack
                 // (acked == durable AND visible, the M6 rule): the maps
                 // hold it immediately and the pending records ride the
@@ -665,12 +685,7 @@ impl Db {
     pub fn create_object(&self) -> Result<ObjectId, FormatError> {
         let (op, oid) = {
             let mut state = self.state.write().unwrap();
-            let lid = LogicalId(state.next_logical_id);
-            state.next_logical_id += 1;
-            let rid = ReplicaId(state.next_replica_id);
-            state.next_replica_id += 1;
-            let pgen = state.next_placement_generation;
-            state.next_placement_generation += 1;
+            let (lid, rid, pgen) = Self::reserve_identity(&mut state);
             let digest = sha256(&lid.to_bytes());
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(&digest[..16]);
@@ -687,6 +702,111 @@ impl Db {
         };
         self.write(&[op])?;
         Ok(oid)
+    }
+
+    /// SE2-M33 — reserve the identity triple under the state lock (the
+    /// allocators only advance — §16/§49, no reuse): `create_object`
+    /// derives its ObjectId from the reserved lid; `put_object`'s
+    /// new-object arm stamps the caller's ObjectId onto the reserved
+    /// triple.
+    fn reserve_identity(state: &mut State) -> (LogicalId, ReplicaId, u64) {
+        let lid = LogicalId(state.next_logical_id);
+        state.next_logical_id += 1;
+        let rid = ReplicaId(state.next_replica_id);
+        state.next_replica_id += 1;
+        let pgen = state.next_placement_generation;
+        state.next_placement_generation += 1;
+        (lid, rid, pgen)
+    }
+
+    /// SE2-M33 — the §14 write path: PUT resolves the ObjectId through the
+    /// §9.1/§9.2 views. An existing object writes under its own ReplicaId;
+    /// an unknown one IS the create — the triple is reserved and
+    /// Create+Put ride ONE frame (one seq, one fsync — atomic by
+    /// construction, deviation 4). Update never allocates (§15 invariant,
+    /// by construction: the existing-object arm resolves through views
+    /// whose bodies are pure map reads). Two concurrent first-puts of the
+    /// same fresh ObjectId fail closed (the second's reserved identity
+    /// conflicts with the first's at the merge gate).
+    pub fn put_object(&self, oid: ObjectId, key: &[u8], value: &[u8]) -> Result<u64, FormatError> {
+        let ops = match LocalIdentityDirectory::new(self).resolve(oid)? {
+            Some(lid) => {
+                let rid = LocalReplicaDirectory::new(self)
+                    .resolve_local(lid)?
+                    .ok_or_else(|| {
+                        FormatError::Corrupt(format!("logical {lid:?} has no local replica"))
+                    })?;
+                vec![Op::PutObject(rid, key.to_vec(), value.to_vec())]
+            }
+            None => {
+                let (lid, rid, pgen) = {
+                    let mut state = self.state.write().unwrap();
+                    Self::reserve_identity(&mut state)
+                };
+                vec![
+                    Op::CreateObject {
+                        oid,
+                        lid,
+                        rid,
+                        pgen,
+                    },
+                    Op::PutObject(rid, key.to_vec(), value.to_vec()),
+                ]
+            }
+        };
+        self.write(&ops)
+    }
+
+    /// SE2-M33 — the §16 delete path: the tombstone carries the object's
+    /// own rid, so its identity metadata survives (the directories keep
+    /// the mapping; placement eventually Retired — M35). Deleting an
+    /// unknown ObjectId is caller misuse — fail closed.
+    pub fn delete_object(&self, oid: ObjectId, key: &[u8]) -> Result<u64, FormatError> {
+        let lid = LocalIdentityDirectory::new(self)
+            .resolve(oid)?
+            .ok_or_else(|| {
+                FormatError::Invalid(format!("delete_object on unknown ObjectId {oid:?}"))
+            })?;
+        let rid = LocalReplicaDirectory::new(self)
+            .resolve_local(lid)?
+            .ok_or_else(|| FormatError::Corrupt(format!("logical {lid:?} has no local replica")))?;
+        self.write(&[Op::DeleteObject(rid, key.to_vec())])
+    }
+
+    /// SE2-M33 — the §13 read path: resolve → read through the identity
+    /// filter. The memtable probe matches the object's OWN entries
+    /// (replica_id == rid) — a byte-API row at the same key is another
+    /// layer's data and never answers an object read (§11). Segments
+    /// cannot answer yet (on-disk entries carry no replica_id until block
+    /// v3 — SE2-M34), so a miss with segments present fails closed
+    /// instead of reading unqualified bytes.
+    pub fn get_object(&self, oid: ObjectId, key: &[u8]) -> Result<Option<Vec<u8>>, FormatError> {
+        let Some(lid) = LocalIdentityDirectory::new(self).resolve(oid)? else {
+            return Ok(None); // never created — not a read error
+        };
+        let rid = LocalReplicaDirectory::new(self)
+            .resolve_local(lid)?
+            .ok_or_else(|| FormatError::Corrupt(format!("logical {lid:?} has no local replica")))?;
+        let (value, has_segments) = {
+            let state = self.state.read().unwrap();
+            if let Some(e) = state.active.get_by_rid(key, rid) {
+                return Ok(e.value.clone());
+            }
+            for mem in state.immutables.iter().rev() {
+                if let Some(e) = mem.get_by_rid(key, rid) {
+                    return Ok(e.value.clone());
+                }
+            }
+            (None, !state.segment_records.is_empty())
+        };
+        if has_segments {
+            return Err(FormatError::Unsupported(
+                "get_object past flush: segment entries carry no replica_id until \
+                 block v3 (SE2-M34)"
+                    .into(),
+            ));
+        }
+        Ok(value)
     }
 
     /// SE2-M30 — ObjectId → LogicalId (spec §9.1, the Db-level surface;
@@ -1390,6 +1510,9 @@ fn batch_bytes_of(b: &Batch) -> usize {
             // SE2-M30/M32 — the fixed payload width (oid 16 + lid 8 +
             // rid 8 + pgen 8), for the group-cap accounting.
             Op::CreateObject { .. } => 40,
+            // SE2-M33 — rid 8 + key (+ value), the §17/§18 op shape.
+            Op::PutObject(_, k, v) => 8 + k.len() + v.len(),
+            Op::DeleteObject(_, k) => 8 + k.len(),
         })
         .sum()
 }
@@ -1549,6 +1672,13 @@ fn commit_group(
                 match op {
                     Op::Put(k, v) => st.active.apply(k.clone(), *seq, Some(v.clone())),
                     Op::Delete(k) => st.active.apply(k.clone(), *seq, None),
+                    // SE2-M33 — the committer applies object ops with the
+                    // same shape as Sync's write().
+                    Op::PutObject(rid, k, v) => {
+                        st.active
+                            .apply_object(k.clone(), *seq, Some(v.clone()), *rid)
+                    }
+                    Op::DeleteObject(rid, k) => st.active.apply_object(k.clone(), *seq, None, *rid),
                     // SE2-M30 — the same apply as Sync's write(): the ids
                     // were reserved at submit time, so the committer just
                     // merges and pends them (acked == visible).

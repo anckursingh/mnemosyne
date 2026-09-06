@@ -297,3 +297,29 @@ fn orphan_logs(dir: &Path, current_generation: u64, stem: &str) -> Vec<u64> {
     orphans.sort_unstable();
     orphans
 }
+
+/// §9.1 — resolves an ObjectId to its LogicalId. SE2-M33 lands the trait
+/// with its internal-use moment: the object API (`get_object`/`put_object`/
+/// `delete_object`) resolves through this view, so the §27 surface is
+/// exercised, not speculative.
+pub trait IdentityResolver: Send + Sync {
+    fn resolve(&self, object_id: ObjectId) -> Result<Option<LogicalId>, FormatError>;
+}
+
+/// The MVP implementation: a live view over one Db's identity state (the
+/// §27 note — resolution always sees the current maps, never a snapshot).
+pub struct LocalIdentityDirectory<'a> {
+    db: &'a crate::db::Db,
+}
+
+impl<'a> LocalIdentityDirectory<'a> {
+    pub fn new(db: &'a crate::db::Db) -> Self {
+        Self { db }
+    }
+}
+
+impl IdentityResolver for LocalIdentityDirectory<'_> {
+    fn resolve(&self, object_id: ObjectId) -> Result<Option<LogicalId>, FormatError> {
+        Ok(self.db.resolve_object(object_id))
+    }
+}
