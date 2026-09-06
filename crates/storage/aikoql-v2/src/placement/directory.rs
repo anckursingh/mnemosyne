@@ -271,12 +271,13 @@ fn log_generation(name: &str) -> Option<u64> {
 }
 
 /// Delta logs at or below CURRENT's generation, oldest first; a damaged
-/// authoritative log fails closed. Segment placements run through the
-/// caller's validation closure.
+/// authoritative log fails closed. SE2-M35 — structural validation is the
+/// caller's, on the MERGED map: records superseded by a relocation may
+/// legitimately name segments the relocation retired, so a per-log
+/// validator would reject history (the loader no longer validates).
 pub fn load_placement_logs(
     dir: &Path,
     current_generation: u64,
-    validate: &mut dyn FnMut(&PhysicalLocation) -> Result<(), FormatError>,
 ) -> Result<Vec<PlacementLog>, FormatError> {
     let mut gens = Vec::new();
     for entry in std::fs::read_dir(dir)
@@ -302,11 +303,6 @@ pub fn load_placement_logs(
                 "PLACEMENT-{gen:06}.log carries generation {}",
                 log.generation
             )));
-        }
-        for rec in &log.records {
-            if let Placement::Segment(loc) = rec.placement {
-                validate(&loc)?;
-            }
         }
         logs.push(log);
     }
@@ -362,16 +358,23 @@ impl PlacementDirectory {
 
     /// Rebuild from the delta logs ≤ CURRENT's generation, validating
     /// Segment placements through the caller's closure (the M0 pattern —
-    /// format contracts standalone before Db wiring).
+    /// format contracts standalone before Db wiring). SE2-M35 — validation
+    /// runs on the SURVIVING map after the merge gate: superseded records
+    /// may name retired segments; history is not corruption.
     pub fn recover(
         dir: &Path,
         current_generation: u64,
         validate: &mut dyn FnMut(&PhysicalLocation) -> Result<(), FormatError>,
     ) -> Result<Self, FormatError> {
         let mut placements = HashMap::new();
-        for log in load_placement_logs(dir, current_generation, validate)? {
+        for log in load_placement_logs(dir, current_generation)? {
             for rec in &log.records {
                 merge_placement(&mut placements, rec.rid, rec.placement)?;
+            }
+        }
+        for p in placements.values() {
+            if let Placement::Segment(loc) = p {
+                validate(loc)?;
             }
         }
         Ok(PlacementDirectory { placements })

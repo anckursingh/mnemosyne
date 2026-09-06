@@ -165,6 +165,16 @@ impl SegmentWriter {
         self.entries.push(entry);
     }
 
+    /// SE2-M35 — the compaction merge flips the writer to v3 the moment an
+    /// identity-carrying entry arrives: buffered rid-0 entries encode
+    /// identically (v3 is v2 + the rid field), and a chunk already
+    /// published as v2 stays valid — chunks are independent segments and
+    /// the reader dispatches per block version.
+    pub(crate) fn enable_v3(&mut self) {
+        self.v2 = true;
+        self.v3 = true;
+    }
+
     /// SE2-M34 — `publish` keeps its M15 shape (the manifest fields); the
     /// anchor list is the identity flush's extra return.
     pub fn publish(&mut self, path: &Path) -> Result<(u64, u64), FormatError> {

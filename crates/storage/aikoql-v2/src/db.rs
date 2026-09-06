@@ -318,30 +318,31 @@ impl Db {
         }
 
         // SE2-M32 — placement directory: apply every delta log ≤ CURRENT's
-        // generation (oldest first) through the structural validator — a
-        // Segment placement must name a manifest segment with an in-range
-        // block/entry, anything else fails closed. Newer orphans are
-        // reported and ignored (the §24 state-C window: the WAL still
-        // holds the ops, replay rebuilds the same records).
+        // generation (oldest first) through the one merge gate. SE2-M35 —
+        // the structural validator runs on the SURVIVING map, not per log:
+        // a relocation log supersedes the flush logs' records, and a
+        // superseded location naming a compacted-away segment is history,
+        // not corruption. What remains must name a manifest segment with
+        // an in-range block/entry — anything else fails closed. Newer
+        // orphans are reported and ignored (the §24 state-C window: the
+        // WAL still holds the ops, replay rebuilds the same records).
         let mut placements: HashMap<ReplicaId, Placement> = HashMap::new();
-        {
-            let segment_ids: HashSet<u64> =
-                manifest.segments.iter().map(|s| s.segment_id).collect();
-            let mut validate = |loc: &PhysicalLocation| -> Result<(), FormatError> {
+        for log in load_placement_logs(&config.dir, current.manifest_generation)? {
+            for rec in &log.records {
+                merge_placement(&mut placements, rec.rid, rec.placement)?;
+            }
+        }
+        let segment_ids: HashSet<u64> = manifest.segments.iter().map(|s| s.segment_id).collect();
+        for (rid, p) in &placements {
+            if let Placement::Segment(loc) = p {
                 let reader = readers_by_segment.get(&loc.segment_id.0).ok_or_else(|| {
                     FormatError::Corrupt(format!(
-                        "placement references segment {} absent from the manifest",
+                        "placement for replica {rid:?} references segment {} absent from the manifest",
                         loc.segment_id.0
                     ))
                 })?;
                 let entries = reader.block_entry_count(loc.block_id.0);
-                validate_segment_location(loc, &segment_ids, entries)
-            };
-            for log in load_placement_logs(&config.dir, current.manifest_generation, &mut validate)?
-            {
-                for rec in &log.records {
-                    merge_placement(&mut placements, rec.rid, rec.placement)?;
-                }
+                validate_segment_location(loc, &segment_ids, entries)?;
             }
         }
         for gen in orphan_placement_logs(&config.dir, current.manifest_generation) {
@@ -1249,7 +1250,12 @@ impl Db {
         // in the SAME window as its segment (the §23 order): the anchor is
         // the replica's max-seq entry location, the record's generation
         // fresh (§32: a move IS a new generation).
-        for (rid, (_seq, segment_id, block_id, entry_offset)) in anchors {
+        // SE2-M35 — deterministic generation order: identical workloads
+        // must allocate identical generations (the crash-pin replays and
+        // any future cross-node comparison compare them).
+        let mut ordered_anchors: Vec<_> = anchors.into_iter().collect();
+        ordered_anchors.sort_by_key(|&(rid, _)| rid);
+        for (rid, (_seq, segment_id, block_id, entry_offset)) in ordered_anchors {
             let pgen = state.next_placement_generation;
             state.next_placement_generation += 1;
             let placement = Placement::Segment(PhysicalLocation {
@@ -1349,24 +1355,13 @@ impl Db {
     /// are genuinely obsolete (superseded heads, tombstoned keys); the
     /// engine stays key-space-generic. ARCHIVE rows land in
     /// `archive/ARCHIVE-{id:06}.seg` and leave the live key space.
+    /// SE2-M35 — Segment-placed replicas relocate with the merge (design
+    /// §21–25): the relocation set names each one's new home (the
+    /// surviving max-seq entry's anchor, or Retired when nothing of it
+    /// survived the live key space), the placement log publishes in the
+    /// §23 window before the manifest, and the in-memory placements swap
+    /// only after CURRENT.
     pub fn compact_with(&self, policy: &dyn RetentionPolicy) -> Result<CompactStats, FormatError> {
-        // SE2-M34 — fail closed while any placement names a segment: the
-        // merge rewrites segments as v2 (rids dropped) and deletes the old
-        // files, so a Segment placement would dangle into a Corrupt reopen.
-        // SE2-M35 relocates placements through compaction; until it ships,
-        // compacting identity-carrying data is caller misuse.
-        if self
-            .state
-            .read()
-            .unwrap()
-            .placements
-            .values()
-            .any(|p| matches!(p, Placement::Segment(_)))
-        {
-            return Err(FormatError::Unsupported(
-                "compact with Segment placements: relocation lands in SE2-M35".into(),
-            ));
-        }
         let mut state = self.state.write().unwrap();
         if state.segments.is_empty() {
             return Ok(CompactStats::default());
@@ -1376,7 +1371,7 @@ impl Db {
             cache: self.cache.clone(),
             stats: Some(Arc::clone(&self.stats)),
         };
-        let (stats, chunks) = merge(
+        let (stats, chunks, relocations) = merge(
             &state.segments,
             self.config.block_target,
             self.config.merge_chunk_bytes,
@@ -1387,6 +1382,45 @@ impl Db {
         )?;
         crash_park("AIKOQL_V2_COMPACT_PARK", &self.config.dir, "after_segment");
 
+        // SE2-M35 — every Segment-placed replica relocates: a fresh §25
+        // generation per move, the relocation set's anchor as the new home,
+        // Retired when the merge dropped the replica's last live entry.
+        // Memtable-placed replicas keep theirs — the next flush moves them.
+        let mut placement_records = Vec::new();
+        let mut segment_rids: Vec<ReplicaId> = state
+            .placements
+            .iter()
+            .filter_map(|(&rid, p)| matches!(p, Placement::Segment(_)).then_some(rid))
+            .collect();
+        // SE2-M35 — sorted, so the fresh generations assign deterministically.
+        segment_rids.sort_unstable();
+        for rid in segment_rids {
+            let pgen = state.next_placement_generation;
+            state.next_placement_generation += 1;
+            let relocated = match relocations.get(&rid) {
+                Some(Some(loc)) => Placement::Segment(PhysicalLocation {
+                    segment_id: loc.0,
+                    block_id: loc.1,
+                    entry_offset: loc.2,
+                    generation: pgen,
+                }),
+                Some(None) => Placement::Retired { generation: pgen },
+                // Fail closed: the merge saw every entry of every input
+                // segment, so a Segment-placed replica missing from the set
+                // means the placement predates the input — never relocate
+                // what cannot be proven.
+                None => {
+                    return Err(FormatError::Corrupt(format!(
+                        "segment-placed replica {rid:?} absent from the relocation set"
+                    )))
+                }
+            };
+            placement_records.push(PlacementRecord {
+                rid,
+                placement: relocated,
+            });
+        }
+
         let old_paths: Vec<PathBuf> = state
             .segment_records
             .iter()
@@ -1394,7 +1428,7 @@ impl Db {
             .collect();
         let mut new_records = Vec::new();
         let mut new_segments = Vec::new();
-        for (segment_id, (reader, file_size, checksum)) in chunks {
+        for (segment_id, (reader, file_size, checksum), _anchors) in chunks {
             new_records.push(SegmentRecord {
                 segment_id,
                 level: 1,
@@ -1410,6 +1444,24 @@ impl Db {
         }
         state.next_segment_id = next_id;
         state.generation += 1;
+        // SE2-M35 — the relocation records publish at the NEW generation,
+        // before the manifest names it (the §23 order, mirroring flush):
+        // state-C — log durable, manifest not — keeps the old placements
+        // authoritative (the new log is an orphan past CURRENT), state-D
+        // applies them on reopen. A compaction that relocated nothing
+        // publishes no log — gaps are normal.
+        if !placement_records.is_empty() {
+            let log = PlacementLog {
+                format_version: FORMAT_VERSION,
+                generation: state.generation,
+                records: placement_records.clone(),
+            };
+            PlacementLog::publish(
+                &placement_log_path(&self.config.dir, state.generation),
+                &log,
+            )?;
+        }
+        crash_park("AIKOQL_V2_COMPACT_PARK", &self.config.dir, "after_location");
         let manifest = Manifest {
             format_version: FORMAT_VERSION,
             generation: state.generation,
@@ -1433,6 +1485,11 @@ impl Db {
         // Arc<Segment> lifetime guarantee, via the OS).
         state.segments = Arc::new(new_segments);
         state.segment_records = new_records;
+        for rec in &placement_records {
+            // Infallible in practice — the records carry fresh generations —
+            // but the gate stays the one path in.
+            merge_placement(&mut state.placements, rec.rid, rec.placement)?;
+        }
         for p in &old_paths {
             if let Err(e) = std::fs::remove_file(p) {
                 // Not fatal: the segment is unreferenced — a leftover is

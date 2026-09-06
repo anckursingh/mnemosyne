@@ -21,13 +21,24 @@
 //! ids come from one counter (archive chunks pull lazily). A crash
 //! mid-merge leaves only orphan chunks the next open ignores; the
 //! manifest naming all chunks stays the single atomic commit point.
+//!
+//! SE2-M35 — relocation (design §21–25): identity-carrying entries flip
+//! each chunk writer to v3, the published chunks' anchors aggregate into
+//! the RelocationSet (per-rid max-seq surviving entry; None = nothing
+//! survived the live key space — Retired), and the compaction driver
+//! turns it into placement records under the §23 publication order.
+//! The merge itself stays placement-agnostic — it returns the raw
+//! material, the driver owns the protocol.
 
 use crate::format::FormatError;
+use crate::identity::ReplicaId;
+use crate::placement::{BlockId, SegmentId};
 use crate::segment::{
-    SegmentAttach, SegmentEntry, SegmentIter, SegmentReader, SegmentWriter, FLAG_DELETE,
+    SegmentAnchor, SegmentAttach, SegmentEntry, SegmentIter, SegmentReader, SegmentWriter,
+    FLAG_DELETE,
 };
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -44,6 +55,19 @@ pub struct CompactStats {
 /// manifest record fields publish computes (SE2-M15 — file size and
 /// whole-file checksum8, so callers never read the segment back).
 pub type PublishedSegment = (SegmentReader, u64, u64);
+
+/// One published live chunk: its segment id, the open validated reader
+/// with its manifest-record fields, and its anchors (SE2-M35 — the
+/// relocation set's raw material).
+pub(crate) type LiveChunk = (u64, PublishedSegment, Vec<SegmentAnchor>);
+
+/// SE2-M35 — one replica's relocation: its surviving max-seq entry's new
+/// home in the merged output, or `None` when nothing of it survived the
+/// live key space (tombstone winner, policy drop, or archive) — the §16
+/// Retired case. The compaction driver turns each into a placement record
+/// with a fresh §25 generation.
+pub(crate) type Relocation = Option<(SegmentId, BlockId, u32)>;
+pub(crate) type RelocationSet = HashMap<ReplicaId, Relocation>;
 
 /// Per-key-class verdict for a compaction (SE2-M5). The policy is an
 /// input, never an engine feature — the engine stays key-space-generic.
@@ -93,7 +117,7 @@ pub(crate) fn merge(
     next_id: &mut u64,
     policy: &dyn RetentionPolicy,
     attach: &SegmentAttach,
-) -> Result<(CompactStats, Vec<(u64, PublishedSegment)>), FormatError> {
+) -> Result<(CompactStats, Vec<LiveChunk>, RelocationSet), FormatError> {
     let mut stats = CompactStats {
         segments_in: inputs.len() as u64,
         ..CompactStats::default()
@@ -120,10 +144,17 @@ pub(crate) fn merge(
         len: 0,
         chunks: Vec::new(),
     };
+    // SE2-M35 — every rid the merge saw, anchored at its surviving
+    // max-seq entry (the newest chunk carrying it wins) or None when
+    // nothing of it survived the live output.
+    let mut seen: HashSet<ReplicaId> = HashSet::new();
     let mut archive: Option<ArchiveSink> = None;
     while let Some((key, _, i)) = heap.pop() {
         let winner = fronts[i].take().expect("front present");
         stats.entries_in += 1;
+        if winner.replica_id != ReplicaId(0) {
+            seen.insert(winner.replica_id);
+        }
         // Advance the winner's iterator FIRST: one segment can hold
         // several versions of the key, and a version not yet in the heap
         // would otherwise pop later as a fresh winner (duplicate).
@@ -138,7 +169,11 @@ pub(crate) fn merge(
             .is_some_and(|(k, _, _)| k.0.as_slice() == key.0.as_slice())
         {
             let (_, _, j) = heap.pop().expect("peeked");
-            losers.push(fronts[j].take().expect("front present"));
+            let loser = fronts[j].take().expect("front present");
+            if loser.replica_id != ReplicaId(0) {
+                seen.insert(loser.replica_id);
+            }
+            losers.push(loser);
             stats.entries_in += 1;
             advance(&mut iters, &mut fronts, &mut heap, j)?;
         }
@@ -183,7 +218,26 @@ pub(crate) fn merge(
         }
     }
     stats.segments_out = live.chunks.len() as u64;
-    Ok((stats, live.chunks))
+    // The relocation set: per-rid anchors aggregate across chunks (a
+    // replica's keys may straddle a chunk boundary — the max-seq entry's
+    // chunk wins), and every seen rid gets its entry (None = Retired).
+    let mut anchored: HashMap<ReplicaId, (u64, SegmentId, BlockId, u32)> = HashMap::new();
+    for (segment_id, _published, anchors) in &live.chunks {
+        for a in anchors {
+            let slot = (a.seq, SegmentId(*segment_id), a.block_id, a.entry_offset);
+            match anchored.get(&a.replica_id) {
+                Some(&(best, ..)) if best >= a.seq => {}
+                _ => {
+                    anchored.insert(a.replica_id, slot);
+                }
+            }
+        }
+    }
+    let mut relocations: RelocationSet = HashMap::new();
+    for &rid in &seen {
+        relocations.insert(rid, anchored.get(&rid).map(|&(_, sid, b, o)| (sid, b, o)));
+    }
+    Ok((stats, live.chunks, relocations))
 }
 
 /// Wire-size upper bound of one entry (shared-prefix savings ignored — an
@@ -213,6 +267,12 @@ fn push_live(
             attach,
         )?);
     }
+    // SE2-M35 — an identity-carrying entry flips the writer to v3: the
+    // merged output persists rids, so the relocation anchors can point at
+    // them (rid-0 rows encode identically either way).
+    if e.replica_id != ReplicaId(0) {
+        sink.writer.enable_v3();
+    }
     sink.len += est;
     sink.writer.push(e);
     Ok(())
@@ -221,20 +281,22 @@ fn push_live(
 /// Publish one buffered live chunk at SEGMENT-{id:06}.seg, pulling its id
 /// from `next_id`, and reopen it for validation — with `attach`, so reads
 /// the merged segment serves are cached and attributed (SE2-M21).
+/// SE2-M35 — the chunk's anchors come back too (empty for a v2 chunk):
+/// they are the relocation set's raw material.
 fn publish_chunk(
     writer: &mut SegmentWriter,
     len: &mut usize,
     dir: &Path,
     next_id: &mut u64,
     attach: &SegmentAttach,
-) -> Result<(u64, PublishedSegment), FormatError> {
+) -> Result<LiveChunk, FormatError> {
     let id = *next_id;
     *next_id += 1;
     let path = crate::segment::segment_path(dir, id);
-    let (file_size, checksum) = writer.publish(&path)?;
+    let (file_size, checksum, anchors) = writer.publish_with_anchors(&path)?;
     let reader = SegmentReader::open_with(&path, attach.cache.clone(), attach.stats.clone())?;
     *len = 0;
-    Ok((id, (reader, file_size, checksum)))
+    Ok((id, (reader, file_size, checksum), anchors))
 }
 
 /// The live merge output: the buffering writer plus its chunk accounting
@@ -242,7 +304,7 @@ fn publish_chunk(
 struct LiveSink {
     writer: SegmentWriter,
     len: usize,
-    chunks: Vec<(u64, PublishedSegment)>,
+    chunks: Vec<LiveChunk>,
 }
 
 /// The buffered archive output: writer plus its chunk accounting. The
@@ -285,6 +347,11 @@ fn push_archive(
         });
         publish_archive_chunk(&mut sink.writer, &mut sink.len, dir, *this, sink.chunk)?;
         sink.chunk += 1;
+    }
+    // SE2-M35 — the archive preserves identity too: its rows left the live
+    // key space but remain historically readable with their rids.
+    if e.replica_id != ReplicaId(0) {
+        sink.writer.enable_v3();
     }
     sink.len += est;
     sink.writer.push(e);

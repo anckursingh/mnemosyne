@@ -6,12 +6,13 @@
 //! publication the old Memtable placement is not authoritative (FL-003);
 //! a crash before the flush publication leaves the old state governing —
 //! the WAL replays the memtable and its Memtable placements (FL-004, the
-//! §24 state-B window, child-kill harness).
+//! §24 state-B window, child-kill harness). SE2-M35 lifted the compact
+//! guard this file pinned in M34: with Segment placements present,
+//! compaction relocates instead of refusing (FL-005).
 
 mod common;
 
 use aikoql_storage_v2::db::{Config, Db};
-use aikoql_storage_v2::format::FormatError;
 use aikoql_storage_v2::identity::directory::{IdentityResolver, LocalIdentityDirectory};
 use aikoql_storage_v2::identity::topology::{LocalReplicaDirectory, ReplicaDirectory};
 use aikoql_storage_v2::identity::{ObjectId, ReplicaId};
@@ -217,11 +218,11 @@ fn fl004_crash_before_flush_publication_preserves_old_state() {
 }
 
 #[test]
-fn fl005_compact_with_segment_placements_fails_closed() {
-    // SE2-M34 — the fail-closed guard: the merge rewrites segments as v2
-    // (rids dropped) and deletes the old files, so while any placement
-    // names a segment, compacting would dangle it into a Corrupt reopen.
-    // Unsupported until SE2-M35 ships relocation.
+fn fl005_compact_relocates_segment_placements() {
+    // SE2-M35 — the M34 fail-closed guard is LIFTED: the merge now carries
+    // identity, so compacting with Segment placements relocates them — the
+    // replica resolves to its surviving max-seq entry in a fresh merged
+    // segment, the old location retired, the data readable.
     let d = dir("fl005");
     let db = Db::open(Config::new(d.clone())).unwrap();
     let a = oid(0xA1);
@@ -229,17 +230,38 @@ fn fl005_compact_with_segment_placements_fails_closed() {
     db.flush().unwrap(); // Segment placement published
     db.put_object(a, b"k2", b"v2").unwrap();
     db.flush().unwrap(); // two segments — past compact()'s ≤1 pre-check
-    let err = db.compact().unwrap_err();
+    let rid = rid_of(&db, a);
+    let old = LocalPlacementResolver::new(&db)
+        .resolve(rid)
+        .unwrap()
+        .unwrap();
+    let Placement::Segment(old_loc) = old else {
+        panic!("pre-compact placement must be Segment, got {old:?}");
+    };
+    db.compact().unwrap(); // relocates instead of refusing
+    let new = LocalPlacementResolver::new(&db)
+        .resolve(rid)
+        .unwrap()
+        .unwrap();
+    let Placement::Segment(loc) = new else {
+        panic!("the relocated placement must be Segment, got {new:?}");
+    };
     assert!(
-        matches!(err, FormatError::Unsupported(_)),
-        "compact with Segment placements must fail closed, got {err:?}"
+        loc.segment_id != old_loc.segment_id,
+        "the location moves to the merged output"
     );
-    // The refusal changes nothing: the placement and the data stand.
-    assert!(matches!(
-        LocalPlacementResolver::new(&db)
-            .resolve(rid_of(&db, a))
-            .unwrap(),
-        Some(Placement::Segment(_))
-    ));
+    // The anchor names the replica's max-seq surviving entry.
+    let entry = SegmentReader::open(&segment_path(&d, loc.segment_id.0))
+        .unwrap()
+        .entry_at(loc.block_id, loc.entry_offset)
+        .unwrap()
+        .expect("anchor names an entry");
+    assert_eq!(entry.key, b"k2".to_vec());
+    assert_eq!(entry.value, b"v2".to_vec());
+    assert_eq!(entry.replica_id, rid);
     assert_eq!(db.get_object(a, b"k2").unwrap(), Some(b"v2".to_vec()));
+    assert!(
+        !segment_path(&d, old_loc.segment_id.0).exists(),
+        "the old segment is retired"
+    );
 }
