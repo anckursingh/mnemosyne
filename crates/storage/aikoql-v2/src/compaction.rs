@@ -129,9 +129,9 @@ pub(crate) fn merge(
         .map(|it| it.next().transpose())
         .collect::<Result<_, _>>()?;
     // Heap: min key first, then max seq — every version of one key drains
-    // contiguously, so the first pop of a key IS its winner. The key is
-    // Reversed (max-heap pops min key); the seq is NOT — max seq pops
-    // first within a key.
+    // contiguously in seq-descending order. The key is Reversed (max-heap
+    // pops min key); the seq is NOT — max seq pops first within a key,
+    // and advance() only ever pulls further versions of that same key.
     let mut heap: BinaryHeap<(Reverse<Vec<u8>>, u64, usize)> = BinaryHeap::new();
     for (i, f) in fronts.iter().enumerate() {
         if let Some(e) = f {
@@ -150,47 +150,51 @@ pub(crate) fn merge(
     let mut seen: HashSet<ReplicaId> = HashSet::new();
     let mut archive: Option<ArchiveSink> = None;
     while let Some((key, _, i)) = heap.pop() {
-        let winner = fronts[i].take().expect("front present");
+        // SE2-M38 — a key is a shared byte namespace: any number of
+        // replicas may write it, so the winner is per (key, rid) — each
+        // rid's newest entry survives, its older same-rid versions are
+        // losers. Byte-API rows (rid 0) form one group: plain per-key
+        // last-writer-wins. The run drains seq-descending, so a rid's
+        // FIRST entry in the run IS its newest; the advance-first trick
+        // still matters — one segment can hold several versions of the
+        // key, and a version not yet in the heap would otherwise pop
+        // later as a fresh winner.
+        let mut run: Vec<SegmentEntry> = Vec::new();
+        run.push(fronts[i].take().expect("front present"));
         stats.entries_in += 1;
-        if winner.replica_id != ReplicaId(0) {
-            seen.insert(winner.replica_id);
-        }
-        // Advance the winner's iterator FIRST: one segment can hold
-        // several versions of the key, and a version not yet in the heap
-        // would otherwise pop later as a fresh winner (duplicate).
         advance(&mut iters, &mut fronts, &mut heap, i)?;
-        // Losers of the same key drain contiguously (heap order, plus
-        // whatever further versions advance() keeps pulling): only the
-        // newest entry of a key survives the merge — the losers are kept
-        // around only long enough to archive them if the policy asks.
-        let mut losers: Vec<SegmentEntry> = Vec::new();
         while heap
             .peek()
             .is_some_and(|(k, _, _)| k.0.as_slice() == key.0.as_slice())
         {
             let (_, _, j) = heap.pop().expect("peeked");
-            let loser = fronts[j].take().expect("front present");
-            if loser.replica_id != ReplicaId(0) {
-                seen.insert(loser.replica_id);
-            }
-            losers.push(loser);
+            run.push(fronts[j].take().expect("front present"));
             stats.entries_in += 1;
             advance(&mut iters, &mut fronts, &mut heap, j)?;
         }
-        match policy.classify(&winner.key) {
+        for entry in &run {
+            if entry.replica_id != ReplicaId(0) {
+                seen.insert(entry.replica_id);
+            }
+        }
+        let mut grouped: HashSet<ReplicaId> = HashSet::new();
+        match policy.classify(&key.0) {
             Retention::Keep => {
-                if winner.flags & FLAG_DELETE == 0 {
-                    push_live(&mut live, dir, next_id, chunk_bytes, winner, attach)?;
-                    stats.entries_out += 1;
+                for entry in run {
+                    if !grouped.insert(entry.replica_id) {
+                        continue; // an older version of an already-won rid
+                    }
+                    if entry.flags & FLAG_DELETE == 0 {
+                        push_live(&mut live, dir, next_id, chunk_bytes, entry, attach)?;
+                        stats.entries_out += 1;
+                    }
                 }
             }
             Retention::Drop => {}
             Retention::Archive => {
                 let aw = archive.get_or_insert_with(|| ArchiveSink::new(block_target));
-                push_archive(aw, dir, next_id, chunk_bytes, winner)?;
-                stats.entries_archived += 1;
-                for loser in losers {
-                    push_archive(aw, dir, next_id, chunk_bytes, loser)?;
+                for entry in run {
+                    push_archive(aw, dir, next_id, chunk_bytes, entry)?;
                     stats.entries_archived += 1;
                 }
             }

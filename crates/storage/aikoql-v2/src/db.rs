@@ -839,6 +839,30 @@ impl Db {
         self.state.read().unwrap().placements.get(&rid).copied()
     }
 
+    /// SE2-M38 §45 — the per-directory resident byte estimate: capacity ×
+    /// slot size plus the Swiss-table control bytes (allocator overhead
+    /// excluded). The memory-gate report's per-directory rows — the
+    /// directories share one process, so capacity accounting is the exact
+    /// decomposition of their joint footprint.
+    pub fn directory_resident_bytes(&self) -> (usize, usize, usize) {
+        let s = self.state.read().unwrap();
+        let slots = |cap: usize, sz: usize| cap * sz + (cap / 14 + 1) * 16;
+        (
+            slots(
+                s.identity.capacity(),
+                std::mem::size_of::<(ObjectId, LogicalId)>(),
+            ),
+            slots(
+                s.replicas.capacity(),
+                std::mem::size_of::<(LogicalId, ReplicaId)>(),
+            ),
+            slots(
+                s.placements.capacity(),
+                std::mem::size_of::<(ReplicaId, Placement)>(),
+            ),
+        )
+    }
+
     /// Newest layer wins: active → immutables → segments (all newest
     /// first). A tombstone in a newer layer shadows an older value.
     /// SE2-M8: the Db-level read-path counters are recorded here — the

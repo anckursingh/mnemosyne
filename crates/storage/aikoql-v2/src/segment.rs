@@ -243,8 +243,16 @@ impl SegmentWriter {
             let mut len = 0usize;
             let mut prev: Option<Vec<u8>> = None;
             let mut last_restart_key: Option<Vec<u8>> = None;
+            // SE2-M38 — the shared prefix the current key run's head entry
+            // encoded with: a cadence restart that lands mid-run is
+            // repositioned to the run head (see the encode pass), growing
+            // the head's encoding by exactly these bytes.
+            let mut run_head_shared: Option<usize> = None;
             let mut start = 0usize;
             for (i, e) in entries.iter().enumerate() {
+                let key_changed = prev
+                    .as_ref()
+                    .is_none_or(|p| e.key.as_slice() > p.as_slice());
                 let shared_c = shared_of(&prev, e);
                 let est = 2
                     + 2
@@ -259,6 +267,7 @@ impl SegmentWriter {
                     len = 0;
                     prev = None;
                     last_restart_key = None;
+                    run_head_shared = None;
                     start = i;
                 }
                 // v2: every RESTART_INTERVAL-th entry (0, 16, 32, …) with a
@@ -276,6 +285,9 @@ impl SegmentWriter {
                 // block's prev is None) — recomputed like the encode pass,
                 // not from the split estimate above.
                 let shared = if is_restart { 0 } else { shared_of(&prev, e) };
+                if key_changed {
+                    run_head_shared = Some(shared);
+                }
                 len += 2
                     + 2
                     + (e.key.len() - shared)
@@ -285,6 +297,7 @@ impl SegmentWriter {
                     + 1
                     + if v3 { 8 } else { 0 };
                 if is_restart {
+                    len += run_head_shared.take().unwrap_or(0);
                     last_restart_key = Some(e.key.clone());
                 }
                 prev = Some(e.key.clone());
@@ -332,17 +345,45 @@ impl SegmentWriter {
                 restarts.clear();
                 let mut prev: Option<Vec<u8>> = None;
                 let mut last_restart_key: Option<Vec<u8>> = None;
+                // SE2-M38 — (payload position, shared prefix) of the current
+                // key run's head entry. A run can start mid-cadence (one
+                // row per replica — a hot key's run is long): its first
+                // cadence point would land the restart MID-RUN, hiding the
+                // entries between the head and the restart from every
+                // lookup, which scans [last restart ≤ key, next restart).
+                // Reposition the restart to the run head — same count, the
+                // strictly-increasing key invariant holds (the head IS the
+                // run's first entry), density unchanged. The head entry was
+                // encoded with a shared prefix, so re-encode it with its
+                // full key (a restart position must decode standalone).
+                let mut run_head: Option<(u32, usize)> = None;
                 for (count, e) in entries[start..end].iter().enumerate() {
+                    let key_changed = prev
+                        .as_ref()
+                        .is_none_or(|p| e.key.as_slice() > p.as_slice());
                     let is_restart = v2
                         && count.is_multiple_of(RESTART_INTERVAL as usize)
                         && last_restart_key
                             .as_ref()
                             .is_none_or(|k| e.key.as_slice() > k.as_slice());
+                    let shared = if is_restart { 0 } else { shared_of(&prev, e) };
+                    if key_changed {
+                        run_head = Some((payload.len() as u32, shared));
+                    }
                     if is_restart {
-                        restarts.push(payload.len() as u32);
+                        let (hpos, hshared) =
+                            run_head.take().expect("a restart entry starts a run");
+                        if hshared > 0 {
+                            let mut full = Vec::with_capacity(4 + e.key.len());
+                            full.extend_from_slice(&0u16.to_le_bytes());
+                            full.extend_from_slice(&(e.key.len() as u16).to_le_bytes());
+                            full.extend_from_slice(&e.key);
+                            let old_len = 4 + e.key.len() - hshared;
+                            payload.splice(hpos as usize..hpos as usize + old_len, full);
+                        }
+                        restarts.push(hpos);
                         last_restart_key = Some(e.key.clone());
                     }
-                    let shared = if is_restart { 0 } else { shared_of(&prev, e) };
                     payload.extend_from_slice(&(shared as u16).to_le_bytes());
                     payload.extend_from_slice(&((e.key.len() - shared) as u16).to_le_bytes());
                     payload.extend_from_slice(&e.key[shared..]);
@@ -1197,21 +1238,37 @@ impl SegmentReader {
         key: &[u8],
         rid: ReplicaId,
     ) -> Result<Option<SegmentEntry>, FormatError> {
-        let Some(i) = self.locate(key) else {
+        let Some(mut i) = self.locate(key) else {
             return Ok(None);
         };
-        let b = &self.data[i];
-        if !b.v3 {
-            return Ok(None);
+        loop {
+            let b = &self.data[i];
+            // SE2-M38 — the key's equal-key run can straddle a block
+            // boundary (one row per replica: a hot key's run easily
+            // exceeds a block), so a miss on this block falls through
+            // while the run continues into the next one.
+            // ponytail: O(run length) — the rid-filtered scan walks the
+            // key's whole seq-descending run (restarts only bound distinct
+            // keys). M39's §43 certification measures it; the §13 fix is a
+            // per-block rid→offset index, not a scan tweak.
+            let run_spills = self.block_key(&b.last) == key && i + 1 < self.data.len();
+            if b.v3 {
+                let raw = self.block_raw(i)?;
+                let t0 = self.stats.as_ref().map(|_| Instant::now());
+                let out = self.block_get_v2(key, &raw[BLOCK_HEADER_LEN..], true, Some(rid))?;
+                if let (Some(st), Some(t0)) = (&self.stats, t0) {
+                    st.block_decode_ns
+                        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                if out.is_some() {
+                    return Ok(out);
+                }
+            }
+            if !run_spills {
+                return Ok(None);
+            }
+            i += 1;
         }
-        let raw = self.block_raw(i)?;
-        let t0 = self.stats.as_ref().map(|_| Instant::now());
-        let out = self.block_get_v2(key, &raw[BLOCK_HEADER_LEN..], true, Some(rid))?;
-        if let (Some(st), Some(t0)) = (&self.stats, t0) {
-            st.block_decode_ns
-                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
-        Ok(out)
     }
 
     /// Bounded v2/v3 point lookup. The restart table is validated up front
