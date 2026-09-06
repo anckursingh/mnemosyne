@@ -259,9 +259,14 @@ fn block_v3_lookup_with_rid_filter_is_bounded() {
         "a byte-API row never answers an object read"
     );
     let s = db.read_path_stats();
+    // SE2-M39 — the placement-direct attempt opens the anchored window
+    // before the scan fallback: the matching read decodes ≤16, the
+    // absent-key read pays its window (≤16, the anchor sits at another
+    // key) plus the scan's interval (≤16). Three intervals total — the
+    // bound stays O(1), never the key's run.
     assert!(
-        s.entries_decoded <= 2 * 16,
-        "two rid-filtered lookups decode at most two restart intervals, decoded {}",
+        s.entries_decoded <= 3 * 16,
+        "two rid-filtered lookups stay O(1)-bounded, decoded {}",
         s.entries_decoded
     );
 }

@@ -386,6 +386,15 @@ impl Db {
         // fsynced — but preserves every sequence number.
         let mut active = Memtable::new();
         let mut replay_max = 0;
+        // SE2-M39 — replayed object writes re-apply their placement flips;
+        // the flip allocator recovers past the logged records (the State's
+        // value is the post-loop recovery past everything replayed).
+        let mut replay_pgen = placements
+            .values()
+            .map(|p| p.generation())
+            .max()
+            .unwrap_or(0)
+            + 1;
         for frame in &frames {
             for op in &frame.ops {
                 match op {
@@ -395,10 +404,22 @@ impl Db {
                     // replay restores the entry's identity without
                     // consulting the directories.
                     Op::PutObject(rid, k, v) => {
-                        active.apply_object(k.clone(), frame.seq, Some(v.clone()), *rid)
+                        active.apply_object(k.clone(), frame.seq, Some(v.clone()), *rid);
+                        Self::apply_object_placement(
+                            &mut placements,
+                            &mut pending_placements,
+                            &mut replay_pgen,
+                            *rid,
+                        )?;
                     }
                     Op::DeleteObject(rid, k) => {
-                        active.apply_object(k.clone(), frame.seq, None, *rid)
+                        active.apply_object(k.clone(), frame.seq, None, *rid);
+                        Self::apply_object_placement(
+                            &mut placements,
+                            &mut pending_placements,
+                            &mut replay_pgen,
+                            *rid,
+                        )?;
                     }
                     // SE2-M30 — a replayed create re-pends its records:
                     // the next flush re-exports them, so an identity that
@@ -560,9 +581,35 @@ impl Db {
                 Op::PutObject(rid, k, v) => {
                     state
                         .active
-                        .apply_object(k.clone(), seq, Some(v.clone()), *rid)
+                        .apply_object(k.clone(), seq, Some(v.clone()), *rid);
+                    let State {
+                        placements,
+                        pending_placements,
+                        next_placement_generation,
+                        ..
+                    } = &mut *state;
+                    Self::apply_object_placement(
+                        placements,
+                        pending_placements,
+                        next_placement_generation,
+                        *rid,
+                    )?;
                 }
-                Op::DeleteObject(rid, k) => state.active.apply_object(k.clone(), seq, None, *rid),
+                Op::DeleteObject(rid, k) => {
+                    state.active.apply_object(k.clone(), seq, None, *rid);
+                    let State {
+                        placements,
+                        pending_placements,
+                        next_placement_generation,
+                        ..
+                    } = &mut *state;
+                    Self::apply_object_placement(
+                        placements,
+                        pending_placements,
+                        next_placement_generation,
+                        *rid,
+                    )?;
+                }
                 // SE2-M30 — a create applies its identity BEFORE the ack
                 // (acked == durable AND visible, the M6 rule): the maps
                 // hold it immediately and the pending records ride the
@@ -723,6 +770,27 @@ impl Db {
         (lid, rid, pgen)
     }
 
+    /// SE2-M39 — a write moves the replica's newest row into the active
+    /// memtable, so the placement flips before the ack: the §13 direct
+    /// read trusts it (a Segment placement means no newer row hides in a
+    /// memtable). The generation draws from the shared allocator (§32: a
+    /// move IS a new generation); WAL replay re-derives the record the
+    /// same way, so the live-logged record and the replayed one merge
+    /// idempotently (PL-005).
+    fn apply_object_placement(
+        placements: &mut HashMap<ReplicaId, Placement>,
+        pending: &mut Vec<PlacementRecord>,
+        next_generation: &mut u64,
+        rid: ReplicaId,
+    ) -> Result<(), FormatError> {
+        let pgen = *next_generation;
+        *next_generation += 1;
+        let placement = Placement::Memtable { generation: pgen };
+        merge_placement(placements, rid, placement)?;
+        pending.push(PlacementRecord { rid, placement });
+        Ok(())
+    }
+
     /// SE2-M33 — the §14 write path: PUT resolves the ObjectId through the
     /// §9.1/§9.2 views. An existing object writes under its own ReplicaId;
     /// an unknown one IS the create — the triple is reserved and
@@ -793,18 +861,50 @@ impl Db {
             .ok_or_else(|| FormatError::Corrupt(format!("logical {lid:?} has no local replica")))?;
         // SE2-M10 — the state guard covers the memtable probes and the
         // segments arc clone; the disk probes run after the guard drops.
-        let (value, segments) = {
+        // SE2-M39 §13 — a Segment-placed replica answers placement-direct:
+        // its anchor decodes O(RESTART_INTERVAL) entries instead of
+        // scanning the key's whole equal-key run. A put flips the placement
+        // before its ack, so a Segment placement means no newer row can
+        // hide in a memtable. An anchor that doesn't answer (pre-v4
+        // segment, stale, or another key of a multi-key object) falls back
+        // to the rid-filtered scan, which answers every case.
+        let (mem_hit, segments, direct) = {
             let state = self.state.read().unwrap();
-            if let Some(e) = state.active.get_by_rid(key, rid) {
-                return Ok(e.value.clone());
-            }
-            for mem in state.immutables.iter().rev() {
-                if let Some(e) = mem.get_by_rid(key, rid) {
-                    return Ok(e.value.clone());
-                }
-            }
-            (None, Arc::clone(&state.segments))
+            let direct = match state.placements.get(&rid) {
+                Some(Placement::Segment(loc)) => state
+                    .segment_records
+                    .iter()
+                    .position(|r| r.segment_id == loc.segment_id.0)
+                    .and_then(|i| state.segments.get(i).cloned())
+                    .map(|seg| (seg, *loc)),
+                _ => None,
+            };
+            // A Segment placement means no newer row can hide in a
+            // memtable; otherwise probe both — a hit (a tombstone too)
+            // shadows every segment.
+            let mem_hit = if direct.is_some() {
+                None
+            } else if let Some(e) = state.active.get_by_rid(key, rid) {
+                Some(e.value.clone())
+            } else {
+                state.immutables.iter().rev().find_map(|mem| {
+                    mem.get_by_rid(key, rid).map(|e| e.value.clone())
+                })
+            };
+            (mem_hit, Arc::clone(&state.segments), direct)
         };
+        if let Some(v) = mem_hit {
+            return Ok(v);
+        }
+        if let Some((seg, loc)) = direct {
+            if let Some(e) = seg.get_entry_at(key, rid, loc.block_id.0, loc.entry_offset)? {
+                return Ok(if e.flags & FLAG_DELETE != 0 {
+                    None
+                } else {
+                    Some(e.value)
+                });
+            }
+        }
         for seg in segments.iter().rev() {
             if let Some(e) = seg.get_by_rid(key, rid)? {
                 return Ok(if e.flags & FLAG_DELETE != 0 {
@@ -814,7 +914,7 @@ impl Db {
                 });
             }
         }
-        Ok(value)
+        Ok(None)
     }
 
     /// SE2-M30 — ObjectId → LogicalId (spec §9.1, the Db-level surface;
@@ -1221,10 +1321,12 @@ impl Db {
             let id = state.next_segment_id;
             state.next_segment_id += 1;
             let path = segment_path(&config.dir, id);
-            // SE2-M34 — identity-carrying immutables become v3 blocks (rid
-            // per entry); pure byte-API ones stay v2, byte-identical to M9.
+            // SE2-M34/M39 — identity-carrying immutables become v4 blocks
+            // (v3 rid per entry + the dense cadence table the placement
+            // directory reads); pure byte-API ones stay v2, byte-identical
+            // to M9.
             let mut writer = if mem.has_identity() {
-                SegmentWriter::new_v3(config.block_target)
+                SegmentWriter::new_v4(config.block_target)
             } else {
                 SegmentWriter::new_v2(config.block_target)
             };
@@ -1412,7 +1514,15 @@ impl Db {
         // generation per move, the relocation set's anchor as the new home,
         // Retired when the merge dropped the replica's last live entry.
         // Memtable-placed replicas keep theirs — the next flush moves them.
-        let mut placement_records = Vec::new();
+        // SE2-M39 — the pending records (placement flips a put produced
+        // after the last flush) publish in THIS window too: the compaction
+        // removes the input segments from the manifest, and a flip whose
+        // last LOGGED record named one of them would otherwise resurrect a
+        // dangling Segment placement on reopen (M35: no surviving record
+        // may reference a removed segment). The flip's generation predates
+        // the relocation draws (one allocator), so the order never matters.
+        let mut placement_records: Vec<PlacementRecord> =
+            std::mem::take(&mut state.pending_placements);
         let mut segment_rids: Vec<ReplicaId> = state
             .placements
             .iter()
@@ -1474,8 +1584,8 @@ impl Db {
         // before the manifest names it (the §23 order, mirroring flush):
         // state-C — log durable, manifest not — keeps the old placements
         // authoritative (the new log is an orphan past CURRENT), state-D
-        // applies them on reopen. A compaction that relocated nothing
-        // publishes no log — gaps are normal.
+        // applies them on reopen. A compaction that relocated nothing and
+        // drained no pending records publishes no log — gaps are normal.
         if !placement_records.is_empty() {
             let log = PlacementLog {
                 format_version: FORMAT_VERSION,
@@ -1819,9 +1929,43 @@ fn commit_group(
                     // same shape as Sync's write().
                     Op::PutObject(rid, k, v) => {
                         st.active
-                            .apply_object(k.clone(), *seq, Some(v.clone()), *rid)
+                            .apply_object(k.clone(), *seq, Some(v.clone()), *rid);
+                        // SE2-M39 — the placement flip applies and pends
+                        // with the row (acked == visible, the M6 rule).
+                        let State {
+                            placements,
+                            pending_placements,
+                            next_placement_generation,
+                            ..
+                        } = &mut *st;
+                        if let Err(e) = Db::apply_object_placement(
+                            placements,
+                            pending_placements,
+                            next_placement_generation,
+                            *rid,
+                        ) {
+                            outcome = Err(e);
+                            break;
+                        }
                     }
-                    Op::DeleteObject(rid, k) => st.active.apply_object(k.clone(), *seq, None, *rid),
+                    Op::DeleteObject(rid, k) => {
+                        st.active.apply_object(k.clone(), *seq, None, *rid);
+                        let State {
+                            placements,
+                            pending_placements,
+                            next_placement_generation,
+                            ..
+                        } = &mut *st;
+                        if let Err(e) = Db::apply_object_placement(
+                            placements,
+                            pending_placements,
+                            next_placement_generation,
+                            *rid,
+                        ) {
+                            outcome = Err(e);
+                            break;
+                        }
+                    }
                     // SE2-M30 — the same apply as Sync's write(): the ids
                     // were reserved at submit time, so the committer just
                     // merges and pends them (acked == visible).

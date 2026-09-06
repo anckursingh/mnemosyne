@@ -271,11 +271,12 @@ fn push_live(
             attach,
         )?);
     }
-    // SE2-M35 — an identity-carrying entry flips the writer to v3: the
-    // merged output persists rids, so the relocation anchors can point at
-    // them (rid-0 rows encode identically either way).
+    // SE2-M35/M39 — an identity-carrying entry flips the writer to v4
+    // (v3 rids + the dense cadence table): the merged output persists rids
+    // AND placement-direct reads, so relocation anchors keep the fast path
+    // (rid-0 rows encode identically either way).
     if e.replica_id != ReplicaId(0) {
-        sink.writer.enable_v3();
+        sink.writer.enable_v4();
     }
     sink.len += est;
     sink.writer.push(e);
@@ -354,10 +355,10 @@ fn push_archive(
         publish_archive_chunk(&mut sink.writer, &mut sink.len, dir, *this, sink.chunk)?;
         sink.chunk += 1;
     }
-    // SE2-M35 — the archive preserves identity too: its rows left the live
-    // key space but remain historically readable with their rids.
+    // SE2-M35/M39 — the archive preserves identity too: its rows left the
+    // live key space but remain historically readable with their rids.
     if e.replica_id != ReplicaId(0) {
-        sink.writer.enable_v3();
+        sink.writer.enable_v4();
     }
     sink.len += est;
     sink.writer.push(e);

@@ -1,6 +1,6 @@
 # Backend Conformance — v2 (MRFC-KSE-001 §7 + §26)
 
-Date: 2026-09-04 · the six KSE-1 asserts from one shared definition (`tests/common` `kse` module, copied verbatim from v1's harness), run per backend as granular tests (`tests/engine.rs`, V2-Adopt) and as this matrix (`kse20_backend_conformance.rs`, KSE-20). All through `&dyn StorageEngine` — no backend-specific type above the boundary (§32).
+Date: 2026-09-06 · the six KSE-1 asserts from one shared definition (`tests/common` `kse` module, copied verbatim from v1's harness), run per backend as granular tests (`tests/engine.rs`, V2-Adopt) and as this matrix (`kse20_backend_conformance.rs`, KSE-20). All through `&dyn StorageEngine` — no backend-specific type above the boundary (§32).
 
 | backend | KSE-001..006 | persistence (reopen) | physical format | read path |
 |---|---|---|---|---|

@@ -70,8 +70,12 @@ a `get_object` for a replica whose row sits at the tail of its key's
 seq-descending run decodes the entire run (~50,000 entries average in the
 stress — ~630 ns/entry in a debug build; the stress's two verification passes
 are ~2× 5·10⁹ decodes). Correctness is complete; the cost is the §43 latency
-metric's subject. The fix (M39, §13 evidence pack): a per-block rid→offset
-index — not a scan tweak.
+metric's subject. The fix (M39, §13 evidence pack): the placement directory
+itself became the index — a get_object for a Segment-placed replica decodes
+its stored (block, entry) position directly through a dense per-block cadence
+table (block format v4), O(RESTART_INTERVAL) entries instead of the key's
+whole run. No second index structure; the placement directory that recovery
+rebuilds is the one index, so nothing extra can drift.
 
 ## Bug fixes this milestone exposed
 

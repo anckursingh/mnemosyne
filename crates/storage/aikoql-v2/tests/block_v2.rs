@@ -209,8 +209,8 @@ fn block_v2_scan_matches_v1() {
 #[test]
 fn block_v2_future_version_fails_closed() {
     // The M1 v1 golden inputs (segment_golden.rs pins the v1 writer
-    // byte-exact) with the data-block version patched 1 → 4 (3 became a
-    // real format in SE2-M34): with the block
+    // byte-exact) with the data-block version patched 1 → 5 (3 became a
+    // real format in SE2-M34, 4 in SE2-M39): with the block
     // and skeleton checksums recomputed per spec (independently, via c8
     // above), open() must say Unsupported (a newer format, not damage);
     // with the stale checksums it must say Corrupt. Either way it fails
@@ -237,9 +237,10 @@ fn block_v2_future_version_fails_closed() {
         "v1 golden layout changed — update these offsets"
     );
 
-    // Valid checksums → Unsupported.
+    // Valid checksums → Unsupported. SE2-M39: version 4 is now a real
+    // format (v3 + the dense cadence table) — the future version is 5.
     let mut bytes = base.clone();
-    bytes[data_off + 4..data_off + 6].copy_from_slice(&4u16.to_le_bytes());
+    bytes[data_off + 4..data_off + 6].copy_from_slice(&5u16.to_le_bytes());
     let mut sk = Vec::with_capacity(20 + payload_len);
     sk.extend_from_slice(&bytes[data_off..data_off + 20]);
     sk.extend_from_slice(&bytes[data_off + 28..data_off + 28 + payload_len]);
@@ -260,7 +261,7 @@ fn block_v2_future_version_fails_closed() {
 
     // Stale checksums → Corrupt.
     let mut bytes = base;
-    bytes[data_off + 4..data_off + 6].copy_from_slice(&4u16.to_le_bytes());
+    bytes[data_off + 4..data_off + 6].copy_from_slice(&5u16.to_le_bytes());
     let p = tmp("blockv2-future-corrupt");
     std::fs::write(&p, &bytes).unwrap();
     let err = SegmentReader::open(&p).unwrap_err();

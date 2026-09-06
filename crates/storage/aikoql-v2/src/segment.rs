@@ -14,7 +14,8 @@
 //! entry_count u32 | compressed_size u32 | uncompressed_size u32 |
 //! sha256-8(20-byte header + payload)` + payload.
 //! Types: 0 data, 1 index, 2 bloom. Compression 0 = none.
-//! Data blocks are version 1, 2 (SE2-M9) or 3 (SE2-M34); index and bloom
+//! Data blocks are version 1, 2 (SE2-M9), 3 (SE2-M34) or 4 (SE2-M39);
+//! index and bloom
 //! are always version 1. Anything newer fails closed: a block whose
 //! checksum validates is Unsupported (a future format), a stale checksum
 //! is Corrupt.
@@ -129,6 +130,8 @@ pub struct SegmentWriter {
     /// SE2-M34 — v3 data blocks (restart points + per-entry replica id).
     /// v3 implies v2: the restart table is shared.
     v3: bool,
+    /// SE2-M39 — v4 data blocks: v3 + the dense cadence table. v4 ⇒ v3.
+    v4: bool,
 }
 
 impl SegmentWriter {
@@ -138,6 +141,7 @@ impl SegmentWriter {
             entries: Vec::new(),
             v2: false,
             v3: false,
+            v4: false,
         }
     }
 
@@ -147,6 +151,7 @@ impl SegmentWriter {
             entries: Vec::new(),
             v2: true,
             v3: false,
+            v4: false,
         }
     }
 
@@ -158,6 +163,22 @@ impl SegmentWriter {
             entries: Vec::new(),
             v2: true,
             v3: true,
+            v4: false,
+        }
+    }
+
+    /// SE2-M39 §13 — v4 data blocks: v3 plus a dense cadence table (the
+    /// payload position of every RESTART_INTERVAL-th entry, a full key
+    /// there), so a stored entry index decodes standalone — the
+    /// placement-direct read path. v1/v2/v3 blocks stay readable; only
+    /// identity-carrying flushes write v4.
+    pub fn new_v4(target_block_bytes: usize) -> Self {
+        SegmentWriter {
+            target_block_bytes,
+            entries: Vec::new(),
+            v2: true,
+            v3: true,
+            v4: true,
         }
     }
 
@@ -165,14 +186,17 @@ impl SegmentWriter {
         self.entries.push(entry);
     }
 
-    /// SE2-M35 — the compaction merge flips the writer to v3 the moment an
+    /// SE2-M39 — the compaction merge flips the writer to v4 the moment an
     /// identity-carrying entry arrives: buffered rid-0 entries encode
-    /// identically (v3 is v2 + the rid field), and a chunk already
+    /// identically (v4 is v3 + the dense table), and a chunk already
     /// published as v2 stays valid — chunks are independent segments and
-    /// the reader dispatches per block version.
-    pub(crate) fn enable_v3(&mut self) {
+    /// the reader dispatches per block version (M35's flip, upgraded: v3
+    /// blocks keep the rid but not the dense table, so relocated rows
+    /// would fall back to the run scan).
+    pub(crate) fn enable_v4(&mut self) {
         self.v2 = true;
         self.v3 = true;
+        self.v4 = true;
     }
 
     /// SE2-M34 — `publish` keeps its M15 shape (the manifest fields); the
@@ -232,6 +256,7 @@ impl SegmentWriter {
         let seq_hi = entries.iter().map(|e| e.seq).max().expect("non-empty");
         let v2 = self.v2;
         let v3 = self.v3;
+        let v4 = self.v4;
 
         // Block boundaries without the payloads. The split state machine
         // mirrors the encode pass exactly — including the buffered writer's
@@ -281,10 +306,19 @@ impl SegmentWriter {
                     && last_restart_key
                         .as_ref()
                         .is_none_or(|k| e.key.as_slice() > k.as_slice());
+                // SE2-M39 — v4 encodes a full key at EVERY cadence point
+                // (the dense table's decode bases): the cadence entry must
+                // stand alone, so shared = 0 there even mid-run.
+                let is_dense =
+                    v4 && (i - start).is_multiple_of(RESTART_INTERVAL as usize);
                 // After a split the entry encodes with shared = 0 (the new
                 // block's prev is None) — recomputed like the encode pass,
                 // not from the split estimate above.
-                let shared = if is_restart { 0 } else { shared_of(&prev, e) };
+                let shared = if is_restart || is_dense {
+                    0
+                } else {
+                    shared_of(&prev, e)
+                };
                 if key_changed {
                     run_head_shared = Some(shared);
                 }
@@ -315,6 +349,11 @@ impl SegmentWriter {
         let mut payload = Vec::new();
         let mut table = Vec::new();
         let mut restarts: Vec<u32> = Vec::new();
+        // SE2-M39 — the dense cadence table (v4): the payload position of
+        // every RESTART_INTERVAL-th entry. Recorded AFTER the run-head
+        // splice (which grows the payload), so each offset is the entry's
+        // true position.
+        let mut dense: Vec<u32> = Vec::new();
         let mut anchors: HashMap<ReplicaId, SegmentAnchor> = HashMap::new();
         let mut file_size = 0u64;
         let mut whole = Sha256::new();
@@ -343,6 +382,7 @@ impl SegmentWriter {
             for (block_id, &(start, end)) in bounds.iter().enumerate() {
                 payload.clear();
                 restarts.clear();
+                dense.clear();
                 let mut prev: Option<Vec<u8>> = None;
                 let mut last_restart_key: Option<Vec<u8>> = None;
                 // SE2-M38 — (payload position, shared prefix) of the current
@@ -366,7 +406,17 @@ impl SegmentWriter {
                         && last_restart_key
                             .as_ref()
                             .is_none_or(|k| e.key.as_slice() > k.as_slice());
-                    let shared = if is_restart { 0 } else { shared_of(&prev, e) };
+                    // SE2-M39 — v4: every cadence point is a dense decode
+                    // base (full key, position recorded) — even mid-run.
+                    // The key table (`restarts`) keeps M38's run-head-only
+                    // shape: partition_point needs strictly increasing
+                    // keys, so mid-run cadences must NOT join it.
+                    let is_dense = v4 && count.is_multiple_of(RESTART_INTERVAL as usize);
+                    let shared = if is_restart || is_dense {
+                        0
+                    } else {
+                        shared_of(&prev, e)
+                    };
                     if key_changed {
                         run_head = Some((payload.len() as u32, shared));
                     }
@@ -383,6 +433,11 @@ impl SegmentWriter {
                         }
                         restarts.push(hpos);
                         last_restart_key = Some(e.key.clone());
+                    }
+                    if is_dense {
+                        // After the splice: payload.len() is this entry's
+                        // true position.
+                        dense.push(payload.len() as u32);
                     }
                     payload.extend_from_slice(&(shared as u16).to_le_bytes());
                     payload.extend_from_slice(&((e.key.len() - shared) as u16).to_le_bytes());
@@ -435,17 +490,42 @@ impl SegmentWriter {
                 let block = if v2 {
                     // Table first: interval, restart count, then each
                     // restart's absolute payload position (table size +
-                    // entry position).
+                    // entry position). v4 appends the dense cadence table
+                    // (count + offsets) after the restart offsets — both
+                    // tables' positions are absolute, the entry base is
+                    // their combined size.
                     table.clear();
                     table.extend_from_slice(&RESTART_INTERVAL.to_le_bytes());
                     table.extend_from_slice(&(restarts.len() as u32).to_le_bytes());
+                    let table_prefix = if v4 {
+                        6 + 4 * restarts.len() + 4 + 4 * dense.len()
+                    } else {
+                        6 + 4 * restarts.len()
+                    };
                     for &pos in &restarts {
-                        table.extend_from_slice(
-                            &((6 + 4 * restarts.len() + pos as usize) as u32).to_le_bytes(),
-                        );
+                        table.extend_from_slice(&((table_prefix + pos as usize) as u32).to_le_bytes());
+                    }
+                    if v4 {
+                        table.extend_from_slice(&(dense.len() as u32).to_le_bytes());
+                        for &pos in &dense {
+                            table.extend_from_slice(
+                                &((table_prefix + pos as usize) as u32).to_le_bytes(),
+                            );
+                        }
                     }
                     table.extend_from_slice(&payload);
-                    encode_block(BLOCK_DATA, count_u32, &table, if v3 { 3 } else { 2 })
+                    encode_block(
+                        BLOCK_DATA,
+                        count_u32,
+                        &table,
+                        if v4 {
+                            4
+                        } else if v3 {
+                            3
+                        } else {
+                            2
+                        },
+                    )
                 } else {
                     encode_block(BLOCK_DATA, count_u32, &payload, SEGMENT_VERSION)
                 };
@@ -567,6 +647,8 @@ struct DataBlock {
     v2: bool,
     /// SE2-M34 — v3 payload (v2 restart table + per-entry rid). v3 ⇒ v2.
     v3: bool,
+    /// SE2-M39 — v4 payload: v3 + the dense cadence table. v4 ⇒ v3.
+    v4: bool,
     /// Key ranges into the reader's index payload.
     first: Range<usize>,
     last: Range<usize>,
@@ -737,12 +819,12 @@ impl SegmentReader {
             let compressed = hcur.u32()? as usize;
             hcur.u32()?; // uncompressed size (same: compression 0)
             let stored: [u8; 8] = hcur.take(8)?.try_into().expect("8-byte checksum");
-            // SE2-M9/M34 — data blocks are version 1|2|3, index and bloom
-            // stay version 1. Anything else fails closed: a valid checksum
-            // is a future format (Unsupported), a stale one is damage
-            // (Corrupt).
+            // SE2-M9/M34/M39 — data blocks are version 1|2|3|4, index and
+            // bloom stay version 1. Anything else fails closed: a valid
+            // checksum is a future format (Unsupported), a stale one is
+            // damage (Corrupt).
             let in_set = version == SEGMENT_VERSION
-                || ((version == 2 || version == 3) && kind == BLOCK_DATA);
+                || ((2..=4).contains(&version) && kind == BLOCK_DATA);
             if !in_set {
                 if version == 0 {
                     return Err(FormatError::Corrupt("block version 0".into()));
@@ -758,7 +840,7 @@ impl SegmentReader {
                     )));
                 }
                 return Err(FormatError::Unsupported(format!(
-                    "block version {version} (this build: data 1|2|3, index/bloom 1)"
+                    "block version {version} (this build: data 1|2|3|4, index/bloom 1)"
                 )));
             }
             cur += BLOCK_HEADER_LEN as u64;
@@ -780,8 +862,9 @@ impl SegmentReader {
                         header: header_off,
                         payload_len: compressed,
                         entries,
-                        v2: version == 2 || version == 3,
-                        v3: version == 3,
+                        v2: version == 2 || version == 3 || version == 4,
+                        v3: version == 3 || version == 4,
+                        v4: version == 4,
                         first: 0..0,
                         last: 0..0,
                         validated: AtomicBool::new(false),
@@ -1083,7 +1166,7 @@ impl SegmentReader {
             let payload = &raw[BLOCK_HEADER_LEN..];
             for pos in positions {
                 let t1 = self.stats.as_ref().map(|_| Instant::now());
-                let res = self.block_get_v2(keys[pos], payload, b.v3, None)?;
+                let res = self.block_get_v2(keys[pos], payload, b, None)?;
                 if let (Some(st), Some(t1)) = (&self.stats, t1) {
                     st.block_decode_ns
                         .fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1220,7 +1303,7 @@ impl SegmentReader {
         }
         let raw = self.block_raw(i)?;
         let t0 = self.stats.as_ref().map(|_| Instant::now());
-        let out = self.block_get_v2(key, &raw[BLOCK_HEADER_LEN..], b.v3, None)?;
+        let out = self.block_get_v2(key, &raw[BLOCK_HEADER_LEN..], b, None)?;
         if let (Some(st), Some(t0)) = (&self.stats, t0) {
             st.block_decode_ns
                 .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1247,15 +1330,16 @@ impl SegmentReader {
             // boundary (one row per replica: a hot key's run easily
             // exceeds a block), so a miss on this block falls through
             // while the run continues into the next one.
-            // ponytail: O(run length) — the rid-filtered scan walks the
-            // key's whole seq-descending run (restarts only bound distinct
-            // keys). M39's §43 certification measures it; the §13 fix is a
-            // per-block rid→offset index, not a scan tweak.
+            // SE2-M39 §13 — this scan is now the FALLBACK: Segment-placed
+            // replicas answer placement-direct (v4 dense cadence +
+            // get_entry_at, O(RESTART_INTERVAL)); it still walks the
+            // key's whole run for Memtable/Retired placements and stale or
+            // pre-v4 anchors.
             let run_spills = self.block_key(&b.last) == key && i + 1 < self.data.len();
             if b.v3 {
                 let raw = self.block_raw(i)?;
                 let t0 = self.stats.as_ref().map(|_| Instant::now());
-                let out = self.block_get_v2(key, &raw[BLOCK_HEADER_LEN..], true, Some(rid))?;
+                let out = self.block_get_v2(key, &raw[BLOCK_HEADER_LEN..], b, Some(rid))?;
                 if let (Some(st), Some(t0)) = (&self.stats, t0) {
                     st.block_decode_ns
                         .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1284,19 +1368,35 @@ impl SegmentReader {
         &self,
         key: &[u8],
         payload: &[u8],
-        v3: bool,
+        b: &DataBlock,
         rid: Option<ReplicaId>,
     ) -> Result<Option<SegmentEntry>, FormatError> {
         let mut cur = Cursor::new(payload);
         cur.u16()?; // restart interval (stored for forward compat)
         let restarts = cur.u32()? as usize;
-        let table_len = 6 + 4 * restarts;
+        let mut table_len = 6 + 4 * restarts;
         if table_len > payload.len() {
             return Err(FormatError::Corrupt(
                 "v2 restart table exceeds payload".into(),
             ));
         }
-        let offs = &payload[6..table_len];
+        // SE2-M39 — v4 appends the dense cadence table after the restart
+        // offsets; the entry base is their combined size.
+        if b.v4 {
+            if table_len + 4 > payload.len() {
+                return Err(FormatError::Corrupt("v4 table exceeds payload".into()));
+            }
+            let dense =
+                u32::from_le_bytes(payload[table_len..table_len + 4].try_into().expect("u32"))
+                    as usize;
+            table_len += 4 + 4 * dense;
+            if table_len > payload.len() {
+                return Err(FormatError::Corrupt(
+                    "v4 dense table exceeds payload".into(),
+                ));
+            }
+        }
+        let offs = &payload[6..6 + 4 * restarts];
         let mut keys: Vec<&[u8]> = Vec::with_capacity(restarts);
         let mut prev: Option<&[u8]> = None;
         for j in 0..restarts {
@@ -1351,7 +1451,7 @@ impl SegmentReader {
                 let value = cur.vec()?;
                 let seq = cur.u64()?;
                 let flags = cur.u8()?;
-                let entry_rid = if v3 {
+                let entry_rid = if b.v3 {
                     ReplicaId(cur.u64()?)
                 } else {
                     ReplicaId(0)
@@ -1377,7 +1477,7 @@ impl SegmentReader {
             cur.take(value_len)?;
             cur.u64()?; // seq
             cur.u8()?; // flags
-            if v3 {
+            if b.v3 {
                 cur.u64()?; // SE2-M34 — replica id
             }
         }
@@ -1400,11 +1500,27 @@ impl SegmentReader {
             let mut tcur = Cursor::new(payload);
             tcur.u16()?;
             let restarts = tcur.u32()? as usize;
-            let table_len = 6 + 4 * restarts;
+            let mut table_len = 6 + 4 * restarts;
             if table_len > payload.len() {
                 return Err(FormatError::Corrupt(
                     "v2 restart table exceeds payload".into(),
                 ));
+            }
+            // SE2-M39 — v4 appends the dense cadence table; entries start
+            // after both.
+            if b.v4 {
+                if table_len + 4 > payload.len() {
+                    return Err(FormatError::Corrupt("v4 table exceeds payload".into()));
+                }
+                let dense = u32::from_le_bytes(
+                    payload[table_len..table_len + 4].try_into().expect("u32"),
+                ) as usize;
+                table_len += 4 + 4 * dense;
+                if table_len > payload.len() {
+                    return Err(FormatError::Corrupt(
+                        "v4 dense table exceeds payload".into(),
+                    ));
+                }
             }
             table_len
         } else {
@@ -1454,6 +1570,132 @@ impl SegmentReader {
                 .fetch_add(b.entries as u64, Ordering::Relaxed);
         }
         Ok(out)
+    }
+
+    /// SE2-M39 §13 — placement-direct read: decode the entry a placement
+    /// anchor points at — (block_id, entry_offset, block-local) — without
+    /// scanning the key's run. The v4 dense cadence table records the
+    /// payload position of every 16th block entry (each a full key,
+    /// shared = 0, so a window decodes standalone); the anchor's window
+    /// covers ≤ RESTART_INTERVAL entries and the indexed one must be
+    /// (key, rid). A mismatch is corruption (blocks are immutable — the
+    /// placement directory and the block disagree). A stale or non-v4
+    /// anchor answers None: the caller falls back to the run scan. A
+    /// (key, rid) mismatch is None too — anchors are per-rid, so an
+    /// object's other keys legitimately land on its newest key's anchor.
+    pub(crate) fn get_entry_at(
+        &self,
+        key: &[u8],
+        rid: ReplicaId,
+        block_id: u32,
+        entry_index: u32,
+    ) -> Result<Option<SegmentEntry>, FormatError> {
+        let Some(b) = self.data.get(block_id as usize) else {
+            return Ok(None);
+        };
+        if !b.v4 {
+            return Ok(None);
+        }
+        // The anchor's block must be able to hold the key — otherwise the
+        // anchor sits at another key of a multi-key object and the scan
+        // answers cheaper than a window decode.
+        if key < self.block_key(&b.first) || key > self.block_key(&b.last) {
+            return Ok(None);
+        }
+        let raw = self.block_raw(block_id as usize)?;
+        let payload = &raw[BLOCK_HEADER_LEN..];
+        let mut cur = Cursor::new(payload);
+        cur.u16()?; // restart interval
+        let restarts = cur.u32()? as usize;
+        let mut table_len = 6 + 4 * restarts;
+        if table_len + 4 > payload.len() {
+            return Err(FormatError::Corrupt("v4 table exceeds payload".into()));
+        }
+        let dense =
+            u32::from_le_bytes(payload[table_len..table_len + 4].try_into().expect("u32"))
+                as usize;
+        table_len += 4 + 4 * dense;
+        if table_len > payload.len() {
+            return Err(FormatError::Corrupt(
+                "v4 dense table exceeds payload".into(),
+            ));
+        }
+        // Window covering the anchor's entry: dense[j] starts block entry
+        // 16·j (dense[0] is always the block's first entry — count 0 is a
+        // cadence point), the last window ends at the payload.
+        let cadence = entry_index as usize / RESTART_INTERVAL as usize;
+        if cadence >= dense {
+            return Ok(None);
+        }
+        let offs = &payload[6 + 4 * restarts + 4..table_len];
+        let start = u32::from_le_bytes(
+            offs[cadence * 4..cadence * 4 + 4].try_into().expect("u32"),
+        ) as usize;
+        let end = if cadence + 1 < dense {
+            u32::from_le_bytes(
+                offs[(cadence + 1) * 4..(cadence + 1) * 4 + 4]
+                    .try_into()
+                    .expect("u32"),
+            ) as usize
+        } else {
+            payload.len()
+        };
+        if start < table_len || start >= end || end > payload.len() {
+            return Err(FormatError::Corrupt(format!(
+                "v4 dense window [{start}, {end}) outside payload"
+            )));
+        }
+        let t0 = self.stats.as_ref().map(|_| Instant::now());
+        let mut cur = Cursor::new(&payload[start..end]);
+        let mut scratch: Vec<u8> = Vec::new();
+        let target = entry_index as usize % RESTART_INTERVAL as usize;
+        let mut decoded = 0u64;
+        let mut out: Option<SegmentEntry> = None;
+        for j in 0..=target {
+            let shared = cur.u16()? as usize;
+            if shared > scratch.len() {
+                return Err(FormatError::Corrupt(format!(
+                    "entry shared prefix {shared} exceeds previous key {}",
+                    scratch.len()
+                )));
+            }
+            let suffix_len = cur.u16()? as usize;
+            let suffix = cur.take(suffix_len)?;
+            scratch.truncate(shared);
+            scratch.extend_from_slice(suffix);
+            let value = cur.vec()?;
+            let seq = cur.u64()?;
+            let flags = cur.u8()?;
+            let entry_rid = ReplicaId(cur.u64()?); // v4 ⇒ v3
+            decoded += 1;
+            if j == target {
+                out = Some(SegmentEntry {
+                    key: scratch.clone(),
+                    value,
+                    seq,
+                    flags,
+                    replica_id: entry_rid,
+                });
+            }
+        }
+        if let (Some(st), Some(t0)) = (&self.stats, t0) {
+            st.block_decode_ns
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            st.entries_decoded.fetch_add(decoded, Ordering::Relaxed);
+        }
+        let Some(e) = out else {
+            return Err(FormatError::Corrupt(
+                "v4 cadence window ended before the indexed entry".into(),
+            ));
+        };
+        if e.key.as_slice() != key || e.replica_id != rid {
+            // Not corruption: the anchor is the rid's max-seq entry — a
+            // multi-key object's anchor sits at its NEWEST key, so a read
+            // at any other key legitimately mismatches. The caller falls
+            // back to the run scan (which answers every case correctly).
+            return Ok(None);
+        }
+        Ok(Some(e))
     }
 }
 
@@ -1572,7 +1814,7 @@ impl<'a> SegmentScan<'a> {
         }
         let b = &self.reader.data[self.block];
         let raw = self.reader.block_raw(self.block)?;
-        self.pos = scan_seek_pos(&raw[BLOCK_HEADER_LEN..], b.v2, self.start)?;
+        self.pos = scan_seek_pos(&raw[BLOCK_HEADER_LEN..], b.v2, b.v4, self.start)?;
         self.raw = Some(raw);
         self.v3 = b.v3;
         self.block += 1;
@@ -1703,18 +1945,38 @@ fn skip_entry_body(cur: &mut Cursor<'_>, v3: bool) -> Result<(), FormatError> {
 /// scan path never validated the table either; a valid-checksum lying
 /// table is a malicious-writer case. Full-table validation stays where it
 /// exists (block_get_v2); add it here if a v2 table is ever found corrupt.
-fn scan_seek_pos(payload: &[u8], v2: bool, start: &[u8]) -> Result<usize, FormatError> {
+fn scan_seek_pos(
+    payload: &[u8],
+    v2: bool,
+    v4: bool,
+    start: &[u8],
+) -> Result<usize, FormatError> {
     if !v2 {
         return Ok(0);
     }
     let mut cur = Cursor::new(payload);
     cur.u16()?; // restart interval
     let restarts = cur.u32()? as usize;
-    let table_len = 6 + 4 * restarts;
+    let mut table_len = 6 + 4 * restarts;
     if table_len > payload.len() {
         return Err(FormatError::Corrupt(
             "v2 restart table exceeds payload".into(),
         ));
+    }
+    // SE2-M39 — v4 appends the dense cadence table after the restarts.
+    if v4 {
+        if table_len + 4 > payload.len() {
+            return Err(FormatError::Corrupt("v4 table exceeds payload".into()));
+        }
+        let dense = u32::from_le_bytes(
+            payload[table_len..table_len + 4].try_into().expect("u32"),
+        ) as usize;
+        table_len += 4 + 4 * dense;
+        if table_len > payload.len() {
+            return Err(FormatError::Corrupt(
+                "v4 dense table exceeds payload".into(),
+            ));
+        }
     }
     let offs = &payload[6..table_len];
     let at = |j: usize| -> Result<&[u8], FormatError> {
