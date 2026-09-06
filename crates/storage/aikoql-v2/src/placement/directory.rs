@@ -24,7 +24,7 @@
 //! fails closed.
 
 use crate::db::Db;
-use crate::format::{checksum8, publish_atomic, Cursor, FormatError, FORMAT_VERSION};
+use crate::format::{checksum8, publish_atomic_staged, Cursor, FormatError, FORMAT_VERSION};
 use crate::identity::ReplicaId;
 use crate::placement::{BlockId, SegmentId};
 use std::collections::HashMap;
@@ -259,7 +259,12 @@ impl PlacementLog {
     }
 
     pub fn publish(path: &Path, log: &Self) -> Result<(), FormatError> {
-        publish_atomic(path, &log.encode())
+        Self::publish_staged(path, log, None)
+    }
+
+    /// SE2-M36 — the §38 crash windows on the compaction path.
+    pub fn publish_staged(path: &Path, log: &Self, stage: Option<&str>) -> Result<(), FormatError> {
+        publish_atomic_staged(path, &log.encode(), stage)
     }
 }
 

@@ -54,7 +54,7 @@
 //! payload damage fails on access.
 
 use crate::cache::BlockCache;
-use crate::format::{checksum8, publish_atomic_writer, Cursor, FormatError};
+use crate::format::{checksum8, publish_atomic_writer_staged, Cursor, FormatError};
 use crate::identity::ReplicaId;
 use crate::placement::BlockId;
 use crate::stats::Stats;
@@ -198,6 +198,16 @@ impl SegmentWriter {
         &mut self,
         path: &Path,
     ) -> Result<(u64, u64, Vec<SegmentAnchor>), FormatError> {
+        self.publish_with_anchors_staged(path, None)
+    }
+
+    /// SE2-M36 — the staged form parks at the §38 windows; only the
+    /// compaction path stages (SEGMENT).
+    pub fn publish_with_anchors_staged(
+        &mut self,
+        path: &Path,
+        stage: Option<&str>,
+    ) -> Result<(u64, u64, Vec<SegmentAnchor>), FormatError> {
         if self.target_block_bytes == 0 {
             return Err(FormatError::Invalid("target block size must be > 0".into()));
         }
@@ -296,7 +306,7 @@ impl SegmentWriter {
         let mut file_size = 0u64;
         let mut whole = Sha256::new();
 
-        publish_atomic_writer(path, move |f: &mut File| {
+        publish_atomic_writer_staged(path, stage, move |f: &mut File| {
             // Header.
             let mut header = Vec::new();
             header.extend_from_slice(SEGMENT_MAGIC);

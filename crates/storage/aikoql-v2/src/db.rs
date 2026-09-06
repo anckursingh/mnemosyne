@@ -30,7 +30,9 @@
 
 use crate::cache::{BlockCache, CacheStats};
 use crate::compaction::{merge, CompactStats, KeepAll, RetentionPolicy};
-use crate::format::{verify_pair, Current, FormatError, Manifest, SegmentRecord, FORMAT_VERSION};
+use crate::format::{
+    crash_park, verify_pair, Current, FormatError, Manifest, SegmentRecord, FORMAT_VERSION,
+};
 use crate::identity::directory::{
     identity_log_path, load_identity_logs, load_replica_logs, orphan_identity_logs,
     orphan_replica_logs, replica_log_path, IdentityLog, IdentityRecord, IdentityResolver,
@@ -1456,9 +1458,11 @@ impl Db {
                 generation: state.generation,
                 records: placement_records.clone(),
             };
-            PlacementLog::publish(
+            // SE2-M36 — staged: the §38 LOCATION windows park inside.
+            PlacementLog::publish_staged(
                 &placement_log_path(&self.config.dir, state.generation),
                 &log,
+                Some("LOCATION"),
             )?;
         }
         crash_park("AIKOQL_V2_COMPACT_PARK", &self.config.dir, "after_location");
@@ -1468,15 +1472,22 @@ impl Db {
             segments: new_records.clone(),
             wal_ids: vec![],
         };
-        Manifest::publish(
+        // SE2-M36 — staged: the §38 MANIFEST windows park inside.
+        Manifest::publish_staged(
             &manifest_path(&self.config.dir, state.generation),
             &manifest,
+            Some("MANIFEST"),
         )?;
         crash_park("AIKOQL_V2_COMPACT_PARK", &self.config.dir, "after_manifest");
         Current::publish(
             &self.config.dir.join("CURRENT"),
             &Current::new(FORMAT_VERSION, state.generation),
         )?;
+        crash_park(
+            "AIKOQL_V2_PLACE_PARK",
+            &self.config.dir,
+            "FAIL_AFTER_PUBLISH",
+        );
         crash_park("AIKOQL_V2_COMPACT_PARK", &self.config.dir, "after_current");
 
         // Swap readers before deleting: handles open with share-delete, so
@@ -1521,17 +1532,8 @@ impl Drop for Db {
     }
 }
 
-/// Park forever when `var` names this stage — the crash-window harness
-/// (no-op unset). The marker file tells the parent the park was reached.
-fn crash_park(var: &str, dir: &Path, stage: &str) {
-    if std::env::var(var).ok().as_deref() != Some(stage) {
-        return;
-    }
-    std::fs::write(dir.join(stage), b"1").ok();
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(60));
-    }
-}
+// SE2-M36 — crash_park moved to format.rs (the staged publishers park at
+// the §38 write/fsync boundaries; db-level parks share the same helper).
 
 /// A shared writer handle (GroupCommit mode): batches submitted through
 /// handles queue up and commit as groups — one fsync per group, applied

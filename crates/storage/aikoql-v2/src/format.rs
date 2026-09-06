@@ -271,7 +271,16 @@ impl Manifest {
     }
 
     pub fn publish(path: &Path, manifest: &Self) -> Result<(), FormatError> {
-        publish_atomic(path, &manifest.encode())
+        Self::publish_staged(path, manifest, None)
+    }
+
+    /// SE2-M36 — the §38 crash windows on the compaction path.
+    pub fn publish_staged(
+        path: &Path,
+        manifest: &Self,
+        stage: Option<&str>,
+    ) -> Result<(), FormatError> {
+        publish_atomic_staged(path, &manifest.encode(), stage)
     }
 }
 
@@ -295,8 +304,20 @@ pub fn verify_pair(current: &Current, manifest: &Manifest) -> Result<(), FormatE
 /// best-effort directory fsync. The temp lives beside the target (same
 /// volume) so the rename is atomic; a torn write is only ever in the temp,
 /// which nobody reads. The closure's value is returned after the rename.
+/// SE2-M36 — the staged variant parks at the §38 injection points:
+/// `AIKOQL_V2_PLACE_PARK` naming `FAIL_AFTER_{stage}_WRITE` / `_FSYNC`
+/// holds the process at the exact boundary (the child-kill harness kills
+/// it there); `stage` None disables (production and every unstaged path).
 pub(crate) fn publish_atomic_writer<T>(
     path: &Path,
+    write: impl FnOnce(&mut File) -> std::io::Result<T>,
+) -> Result<T, FormatError> {
+    publish_atomic_writer_staged(path, None, write)
+}
+
+pub(crate) fn publish_atomic_writer_staged<T>(
+    path: &Path,
+    stage: Option<&str>,
     write: impl FnOnce(&mut File) -> std::io::Result<T>,
 ) -> Result<T, FormatError> {
     let dir = path.parent().ok_or_else(|| {
@@ -310,7 +331,21 @@ pub(crate) fn publish_atomic_writer<T>(
     let written = (|| -> std::io::Result<T> {
         let mut f = File::create(&tmp)?;
         let v = write(&mut f)?;
+        if let Some(stage) = stage {
+            crash_park(
+                "AIKOQL_V2_PLACE_PARK",
+                dir,
+                &format!("FAIL_AFTER_{stage}_WRITE"),
+            );
+        }
         f.sync_all()?;
+        if let Some(stage) = stage {
+            crash_park(
+                "AIKOQL_V2_PLACE_PARK",
+                dir,
+                &format!("FAIL_AFTER_{stage}_FSYNC"),
+            );
+        }
         drop(f);
         std::fs::rename(&tmp, path)?;
         Ok(v)
@@ -334,6 +369,28 @@ pub(crate) fn publish_atomic_writer<T>(
 
 pub(crate) fn publish_atomic(path: &Path, bytes: &[u8]) -> Result<(), FormatError> {
     publish_atomic_writer(path, |f| f.write_all(bytes))
+}
+
+pub(crate) fn publish_atomic_staged(
+    path: &Path,
+    bytes: &[u8],
+    stage: Option<&str>,
+) -> Result<(), FormatError> {
+    publish_atomic_writer_staged(path, stage, |f| f.write_all(bytes))
+}
+
+/// Park forever when `var` names this stage — the crash-window harness
+/// (no-op unset). The marker file tells the parent the park was reached.
+/// SE2-M36 — moved here from db.rs: the staged publishers (same crate)
+/// park at the write/fsync boundaries.
+pub(crate) fn crash_park(var: &str, dir: &Path, stage: &str) {
+    if std::env::var(var).ok().as_deref() != Some(stage) {
+        return;
+    }
+    std::fs::write(dir.join(stage), b"1").ok();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
 }
 
 pub(crate) struct Cursor<'a> {

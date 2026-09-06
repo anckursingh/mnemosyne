@@ -293,7 +293,9 @@ fn publish_chunk(
     let id = *next_id;
     *next_id += 1;
     let path = crate::segment::segment_path(dir, id);
-    let (file_size, checksum, anchors) = writer.publish_with_anchors(&path)?;
+    // SE2-M36 — staged: publish_chunk only ever runs inside compaction.
+    let (file_size, checksum, anchors) =
+        writer.publish_with_anchors_staged(&path, Some("SEGMENT"))?;
     let reader = SegmentReader::open_with(&path, attach.cache.clone(), attach.stats.clone())?;
     *len = 0;
     Ok((id, (reader, file_size, checksum), anchors))
