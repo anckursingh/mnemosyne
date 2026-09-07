@@ -2907,10 +2907,12 @@ impl CheckExpression {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// let expr = CheckExpression::parse("end_date >= start_date").unwrap();
-    /// let expr = CheckExpression::parse("age >= 18 AND age <= 120").unwrap();
-    /// let expr = CheckExpression::parse("NOT (status = \"deleted\")").unwrap();
+    /// ```rust
+    /// use aikoql_kernel::knowledge::kom::CheckExpression;
+    ///
+    /// let _ = CheckExpression::parse("end_date >= start_date").unwrap();
+    /// let _ = CheckExpression::parse("age >= 18 AND age <= 120").unwrap();
+    /// let _ = CheckExpression::parse("NOT (status = \"deleted\")").unwrap();
     /// ```
     pub fn parse(input: &str) -> Result<CheckExpression, String> {
         let tokens = tokenize(input)?;
