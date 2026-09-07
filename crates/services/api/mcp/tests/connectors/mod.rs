@@ -186,6 +186,7 @@ impl Drop for TempSweeper {
 pub fn temp_db(suffix: &str) -> String {
     let path = std::env::temp_dir().join(format!("mcp-{suffix}-{}.redb", std::process::id()));
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&path); // v2 stores are directories (M41)
     TEMP_PATHS.with(|t| t.borrow_mut().paths.push(path.clone()));
     path.to_string_lossy().into_owned()
 }
@@ -422,15 +423,14 @@ pub fn dsn_with_dbname(dsn: &str, dbname: &str) -> String {
 /// Open the imported db for reads (same engine + id_seed as the CLI — see
 /// mcp src/engine.rs open_kernel_auto). The import process has exited by the
 /// time this runs, so the store file lock is free. The engine must mirror
-/// src/engine.rs `open_engine`'s production default — the child imports as
-/// redb (the stable default, PR#2 review SE-01), and reading those bytes
-/// back as the native WAL engine is the post-gate equivalent of the REC-002
-/// snapshot bug.
+/// src/engine.rs `open_engine`'s production default — since 06f8595 (M41
+/// ADR: v2 ratified) the child imports as a fresh aikoql-v2 directory, so
+/// the read-back opens v2, not redb.
 pub fn open_kernel(db: &str) -> aikoql_kernel::Kernel {
     use aikoql_kernel::storage::store::StorageEngine;
     use aikoql_kernel::{Kernel, SystemClock};
     let store: std::sync::Arc<dyn StorageEngine> = std::sync::Arc::new(
-        aikoql_kernel::storage::store_redb::RedbEngine::open(db)
+        aikoql_storage_v2::AikoqlStorageEngineV2::open(db)
             .unwrap_or_else(|e| panic!("open {db}: {e}")),
     );
     Kernel::open(store, std::sync::Arc::new(SystemClock), 0xA9C9)
