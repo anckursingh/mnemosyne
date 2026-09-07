@@ -3,9 +3,11 @@
 //! 1K / 10K / 100K synthetic knowledge units — n entities + n facts +
 //! 0.8n relations (the retrieval-index records; "KOs" in the spec's
 //! sense, since the IR is the pre-KO candidate surface — declared in the
-//! report). The 1M row is the R14 pointer: benchmarks/benches/scale.rs
-//! (criterion, AIKOQL_BENCH_SCALE knob, ~4GB at 1M) — asserted to exist
-//! and to carry the knob, so the pointer cannot rot silently.
+//! report). PR CI runs 1K + 10K (PR#2 review SE-06);
+//! `W31_SCALE_NIGHTLY=1` adds the 100K row. The 1M row is the R14
+//! pointer: benchmarks/benches/scale.rs (criterion, AIKOQL_BENCH_SCALE
+//! knob, ~4GB at 1M) — asserted to exist and to carry the knob, so the
+//! pointer cannot rot silently.
 //!
 //! Per scale: 12 probes × 3 reps —
 //! - 8 tier lookups ("What is the tier of aaaa?"),
@@ -46,6 +48,18 @@ use common::wave31_sim::{cost, payload_has};
 
 const BUDGET: usize = 300;
 const REPS: usize = 3;
+const NIGHTLY_ENV: &str = "W31_SCALE_NIGHTLY";
+
+/// PR#2 review SE-06: the PR gate runs 1K + 10K; `W31_SCALE_NIGHTLY=1`
+/// adds the 100K row for the canonical scaling report. Strict opt-in —
+/// any other value fails.
+fn sizes() -> &'static [usize] {
+    match std::env::var(NIGHTLY_ENV) {
+        Err(std::env::VarError::NotPresent) => &[1_000, 10_000],
+        Ok(v) if v == "1" => &[1_000, 10_000, 100_000],
+        other => panic!("{NIGHTLY_ENV} strict opt-in: unset or 1, got {other:?}"),
+    }
+}
 
 /// The synthetic candidates' provenance (ingestion-level Evidence — the
 /// kernel Evidence type is the KO surface, not the IR surface).
@@ -193,7 +207,7 @@ fn pct(micros: &[u128], p: f64) -> u128 {
 
 #[test]
 fn w31_scale_001_knowledge_complexity_scaling() {
-    for n in [1_000usize, 10_000, 100_000] {
+    for &n in sizes() {
         let ir = synth_ir(n);
         let services = (n / 5).max(1);
         let customers = n - services;

@@ -4,8 +4,9 @@ Supports both embedded (PyO3) and server (MCP TCP) modes transparently.
 
     from aikoql import Agent
 
-    # Embedded mode (in-process, requires compiled PyO3 extension):
-    db = Agent.connect("./kb.redb")
+    # Embedded mode (in-process, requires compiled PyO3 extension).
+    # A fresh path creates an aikoql-v2 database directory (the default):
+    db = Agent.connect("./kb")
 
     # Server mode (talks to aikoql-mcp over TCP):
     db = Agent.connect("localhost:9090")
@@ -22,7 +23,9 @@ class Agent:
     """Unified aikoql agent interface.
 
     Auto-detects connection mode:
-    - Path ending in .redb → embedded mode (PyO3)
+    - Any filesystem path (fresh or existing) → embedded mode (PyO3).
+      The 2026-09-07 default: a fresh path creates an aikoql-v2 database
+      directory.
     - "host:port" string → server mode (MCP TCP)
     - (host, port) tuple → server mode (MCP TCP)
     """
@@ -45,7 +48,25 @@ class Agent:
                 kwargs.get("client_version", "0.1.0"),
             )
         elif isinstance(target, str):
-            if target.endswith(".redb") or os.path.exists(target):
+            # Server mode iff the string is a bare host:port — no path
+            # separators and a numeric port. Anything path-like (fresh
+            # paths included) is embedded: the engine's own auto-detection
+            # decides aikoql-v2 / redb / v1 from what is on disk.
+            is_host_port = (
+                "/" not in target and "\\" not in target
+                and target.count(":") == 1
+                and target.partition(":")[2].isdigit()
+            )
+            if is_host_port:
+                agent._mode = "mcp"
+                host, _, port = target.partition(":")
+                from .mcp_client import McpClient
+                agent._backend = McpClient(host, int(port)).connect(timeout=kwargs.get("timeout", 5.0))
+                agent._backend.initialize(
+                    kwargs.get("client_name", "aikoql-py"),
+                    kwargs.get("client_version", "0.1.0"),
+                )
+            else:
                 # Embedded mode: use PyO3 native extension.
                 agent._mode = "embedded"
                 try:
@@ -57,16 +78,6 @@ class Agent:
                         "Build with: pip install maturin && maturin develop --release\n"
                         "Or use server mode: Agent.connect('localhost:9090')"
                     )
-            else:
-                # Server mode: assume "host:port".
-                agent._mode = "mcp"
-                host, _, port = target.partition(":")
-                from .mcp_client import McpClient
-                agent._backend = McpClient(host, int(port)).connect(timeout=kwargs.get("timeout", 5.0))
-                agent._backend.initialize(
-                    kwargs.get("client_name", "aikoql-py"),
-                    kwargs.get("client_version", "0.1.0"),
-                )
         else:
             raise TypeError(f"Expected str or tuple, got {type(target).__name__}")
         return agent

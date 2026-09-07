@@ -12,6 +12,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 aikoql-kernel = { path = "../../kernel" }
+aikoql-storage = { path = "../../storage/aikoql" }
+aikoql-storage-v2 = { path = "../../storage/aikoql-v2" }
 aikoql-graph = { path = "../../engines/graph" }
 aikoql-compiler = { path = "../../compiler" }
 aikoql-runtime = { path = "../../runtime" }

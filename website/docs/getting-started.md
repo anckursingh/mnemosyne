@@ -28,8 +28,12 @@ aikoql comes with 10 CLI commands:
 aikoql report ~/my-project
 
 # Ingest and store as Knowledge Objects
-aikoql ingest-dir ~/my-project ./kb.redb
+aikoql ingest-dir ~/my-project ./kb
 ```
+
+A fresh path creates an **aikoql-v2** database directory — the default since
+2026-09-07. Existing `*.redb` files still open as redb and a v1 WAL still
+opens as v1: auto-detection never reinterprets an existing database.
 
 Every entity (file, module, function, test, section) becomes its own Knowledge
 Object with kernel relationships between them (`depends_on`, `implements`,
@@ -61,13 +65,13 @@ aikoql ships as a single, self-contained binary. No dependencies, no installers.
 
 **Windows:**
 ```bash
-curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.18/aikoql-mcp.exe
+curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.19/aikoql-mcp.exe
 .\aikoql-mcp.exe --help
 ```
 
 **Linux (static musl — any distro):**
 ```bash
-curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.18/aikoql-mcp-linux-musl
+curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.19/aikoql-mcp-linux-musl
 chmod +x aikoql-mcp-linux-musl && mv aikoql-mcp-linux-musl /usr/local/bin/aikoql
 ```
 
@@ -76,11 +80,11 @@ A glibc build (`aikoql-mcp-linux`) is also available for distros that prefer dyn
 **macOS (Apple Silicon / Intel):**
 ```bash
 # Apple Silicon
-curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.18/aikoql-mcp-macos-arm64
+curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.19/aikoql-mcp-macos-arm64
 chmod +x aikoql-mcp-macos-arm64 && mv aikoql-mcp-macos-arm64 /usr/local/bin/aikoql
 
 # Intel
-curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.18/aikoql-mcp-macos
+curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.19/aikoql-mcp-macos
 chmod +x aikoql-mcp-macos && mv aikoql-mcp-macos /usr/local/bin/aikoql
 ```
 
@@ -88,7 +92,7 @@ chmod +x aikoql-mcp-macos && mv aikoql-mcp-macos /usr/local/bin/aikoql
 
 ```bash
 aikoql --version
-# aikoql-mcp 0.1.18
+# aikoql-mcp 0.1.19
 ```
 
 ## 5-Second Start
@@ -116,7 +120,7 @@ Bye.
 ### MCP Server (stdio mode)
 
 ```bash
-aikoql serve ./my-knowledge.redb
+aikoql serve ./my-knowledge
 ```
 
 Connects via stdin/stdout — perfect for Claude Code, VS Code, and other MCP clients. Add to your MCP config:
@@ -126,7 +130,7 @@ Connects via stdin/stdout — perfect for Claude Code, VS Code, and other MCP cl
   "mcpServers": {
     "aikoql": {
       "command": "aikoql",
-      "args": ["serve", "./my-knowledge.redb"]
+      "args": ["serve", "./my-knowledge"]
     }
   }
 }
@@ -139,7 +143,7 @@ pass it as `params.token` to MCP `initialize`.
 
 ```bash
 aikoql serve --listen 127.0.0.1:9090 --tcp-token mytoken:acme:admin \
-  --metrics-addr 127.0.0.1:9091 ./my-knowledge.redb
+  --metrics-addr 127.0.0.1:9091 ./my-knowledge
 ```
 
 - MCP endpoint: `tcp://127.0.0.1:9090` (token auth required)
@@ -169,8 +173,8 @@ curl http://127.0.0.1:9091/api/v1/schema
 ### Using the Shell
 
 ```bash
-# Open a file database
-aikoql shell ./kb.redb
+# Open a database (fresh path = aikoql-v2 directory)
+aikoql shell ./kb
 
 # Create objects
 aikoql> CREATE Employee name == "Alice", dept == "Engineering", salary == 125000
@@ -205,7 +209,7 @@ Ollama/OpenAI-compatible endpoint to use a remote model instead
 ### Python
 ```python
 import aikoql_py
-kernel = aikoql_py.Kernel.open("./kb.redb")
+kernel = aikoql_py.Kernel.open("./kb")  # fresh path = aikoql-v2 database directory
 result = kernel.remember({"type_name": "Note", "properties": {"body": "Hello"}})
 ```
 
@@ -245,14 +249,30 @@ employee = ["salary", "ssn"]
 EOF
 
 # Start — wrong/missing passphrase fails closed, never silent plaintext
-aikoql serve --listen :9090 --tcp-token mytoken:acme:admin --metrics-addr :9091 ./encrypted-kb.redb
+aikoql serve --listen :9090 --tcp-token mytoken:acme:admin --metrics-addr :9091 ./encrypted-kb
 ```
 
 See [Encryption Guide](/docs/guides/encryption) for details on key hierarchy, field-level encryption, restart behavior, and compliance.
 
+## Storage Backends
+
+Three engines behind one `StorageEngine` trait, default **aikoql-v2**:
+
+| backend | profile |
+|---|---|
+| `aikoql-v2` | the default — segmented LSM, bounded memory + recovery, best write-mixed throughput |
+| `aikoql` | read-hot, RAM-affordant, bounded dataset |
+| `redb` | compatibility fallback — snapshots and pre-v2 files |
+
+Select with `--backend`, `AIKOQL_BACKEND`, or `storage.backend` in TOML; the
+default auto-detects what is already at the path. Details in
+[Architecture](/docs/architecture), numbers in [Benchmarks](/docs/benchmarks).
+
 ## Next Steps
 
 - [Architecture Overview](/docs/architecture) — Understanding the Knowledge OS
+- [Benchmarks](/docs/benchmarks) — The certified cross-engine matrix
 - [API Reference](/docs/api-reference) — All endpoints and tools
 - [Import Data](/docs/guides/import) — PostgreSQL, SQLite, MongoDB, Neo4j
 - [Programs-as-KOs](/docs/guides/programs) — Deploy your first knowledge program
+- [Development](/docs/development) — Build and test from source

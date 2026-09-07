@@ -1,6 +1,6 @@
 {
   "name": "aikoql",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "description": "The Agent-First Knowledge Database. MCP tools for knowledge CRUD, aikoql queries, graph traversal, hybrid search, context compilation, document ingestion, constraint validation, and more. Embedded single binary, zero runtime deps.",
   "author": {
     "name": "Anckur Singh",
@@ -24,7 +24,7 @@
   "mcpServers": {
     "aikoql": {
       "command": "npx",
-      "args": ["-y", "aikoql-mcp@0.1.18", "serve", "--metrics-addr", "127.0.0.1:9091"]
+      "args": ["-y", "aikoql-mcp@0.1.19", "serve", "--metrics-addr", "127.0.0.1:9091"]
     }
   }
 }

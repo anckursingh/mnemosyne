@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 aikoql-kernel = { path = "../../../kernel" }
+aikoql-storage = { path = "../../../storage/aikoql" }
+aikoql-storage-v2 = { path = "../../../storage/aikoql-v2" }
 aikoql-graph = { path = "../../../engines/graph" }
 aikoql-runtime = { path = "../../../runtime" }
 aikoql-compiler = { path = "../../../compiler" }
@@ -36,6 +38,7 @@ embedding-openai = ["aikoql-semantic/embedding-openai"]
 # through the same drivers the providers use, then assert via the kernel crate
 # directly (aikoql-mcp is a binary crate — no lib API to read state back).
 aikoql-kernel = { path = "../../../kernel" }
+aikoql-storage-v2 = { path = "../../../storage/aikoql-v2" }
 postgres = "0.19"
 mongodb = "3"
 ureq = { version = "2", features = ["json"] }

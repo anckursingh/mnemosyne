@@ -1,0 +1,503 @@
+<title>AikoQL Storage Decision</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+:root {
+  --paper: #f2f5f8;
+  --surface: #fbfcfe;
+  --ink: #16202e;
+  --muted: #5b6b7d;
+  --faint: #8b99aa;
+  --hairline: #d9e1ea;
+  --accent: #2e63d6;
+  --accent-deep: #1d47a8;
+  --bar-dim: #aebccb;
+  --amber: #a05a08;
+  --amber-bg: #fdf3e3;
+  --amber-line: #ecd9b8;
+  --green: #1e7d46;
+  --green-bg: #e9f5ee;
+  --code-bg: #eef2f7;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #121822;
+    --surface: #18202c;
+    --ink: #e3e9f2;
+    --muted: #93a2b5;
+    --faint: #6d7c90;
+    --hairline: #2a3444;
+    --accent: #82a7ef;
+    --accent-deep: #a9c4f5;
+    --bar-dim: #44536a;
+    --amber: #f0b45c;
+    --amber-bg: #2b2316;
+    --amber-line: #4a3a20;
+    --green: #6fca92;
+    --green-bg: #16281d;
+    --code-bg: #10161f;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #121822;
+  --surface: #18202c;
+  --ink: #e3e9f2;
+  --muted: #93a2b5;
+  --faint: #6d7c90;
+  --hairline: #2a3444;
+  --accent: #82a7ef;
+  --accent-deep: #a9c4f5;
+  --bar-dim: #44536a;
+  --amber: #f0b45c;
+  --amber-bg: #2b2316;
+  --amber-line: #4a3a20;
+  --green: #6fca92;
+  --green-bg: #16281d;
+  --code-bg: #10161f;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: 'IBM Plex Serif', Georgia, serif;
+  font-size: 15.5px;
+  line-height: 1.65;
+}
+a { color: var(--accent); }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.layout {
+  max-width: 1120px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 56px;
+  padding: 0 28px;
+}
+@media (max-width: 860px) { .layout { grid-template-columns: 1fr; gap: 24px; } }
+
+/* --- TOC rail --- */
+.toc { position: sticky; top: 32px; align-self: start; padding-top: 44px; }
+@media (max-width: 860px) { .toc { display: none; } }
+.toc .label {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10.5px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--faint); margin-bottom: 10px;
+}
+.toc a {
+  display: block; color: var(--muted); text-decoration: none;
+  font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+  padding: 3.5px 0; border-left: 2px solid var(--hairline); padding-left: 10px;
+}
+.toc a:hover { color: var(--accent); border-left-color: var(--accent); }
+
+/* --- hero --- */
+.hero { padding: 56px 0 8px; }
+.kicker {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+  letter-spacing: 0.14em; text-transform: uppercase; color: var(--faint);
+}
+.badge {
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--green); background: var(--green-bg);
+  border: 1px solid var(--green);
+  border-radius: 999px; padding: 3px 12px;
+}
+.hero h1 {
+  font-family: 'Bricolage Grotesque', 'Segoe UI', sans-serif;
+  font-size: clamp(34px, 5.2vw, 48px);
+  font-weight: 750; letter-spacing: -0.02em; line-height: 1.08;
+  margin: 20px 0 14px; text-wrap: balance;
+}
+.hero .deck {
+  color: var(--muted); font-size: 17px; max-width: 62ch; text-wrap: balance;
+}
+.meta {
+  display: flex; gap: 0 32px; flex-wrap: wrap;
+  margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--hairline);
+  font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted);
+}
+.meta b { color: var(--ink); font-weight: 600; }
+
+/* --- sections --- */
+section { padding: 44px 0 8px; max-width: 720px; }
+.eyebrow {
+  font-family: 'IBM Plex Mono', monospace; font-size: 10.5px;
+  letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent);
+  margin-bottom: 10px;
+}
+h2 {
+  font-family: 'Bricolage Grotesque', 'Segoe UI', sans-serif;
+  font-size: 25px; font-weight: 700; letter-spacing: -0.01em;
+  margin-bottom: 14px; text-wrap: balance;
+}
+h3 {
+  font-family: 'Bricolage Grotesque', 'Segoe UI', sans-serif;
+  font-size: 17px; font-weight: 650; margin: 26px 0 8px;
+}
+p + p { margin-top: 12px; }
+strong { font-weight: 600; }
+
+/* --- tables --- */
+.tablewrap { overflow-x: auto; margin: 18px 0; }
+table {
+  border-collapse: collapse; width: 100%;
+  font-family: 'IBM Plex Mono', monospace; font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+th {
+  text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--ink);
+  font-weight: 600; font-size: 11px; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--muted);
+}
+td { padding: 7px 12px; border-bottom: 1px solid var(--hairline); }
+tr:last-child td { border-bottom: none; }
+td.num, th.num { text-align: right; }
+td.hi { color: var(--accent-deep); font-weight: 600; }
+td.warn { color: var(--amber); font-weight: 600; }
+td.ok { color: var(--green); font-weight: 600; }
+
+/* --- the W8 strip --- */
+.w8 { background: var(--surface); border: 1px solid var(--hairline); border-radius: 10px; padding: 22px 24px 18px; margin: 22px 0; }
+.w8 h3 { margin-top: 0; }
+.w8 .note { color: var(--muted); font-size: 13px; font-family: 'IBM Plex Mono', monospace; margin: -6px 0 12px; }
+.w8 .stats { display: flex; gap: 24px 44px; flex-wrap: wrap; margin-top: 16px; }
+.w8 .stat .v { font-family: 'IBM Plex Mono', monospace; font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.w8 .stat.win .v { color: var(--accent-deep); }
+.w8 .stat .l { font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint); margin-top: 2px; }
+.w8 svg { width: 100%; height: auto; display: block; }
+
+/* --- gate meter --- */
+.meter { position: relative; height: 26px; background: var(--code-bg); border: 1px solid var(--hairline); border-radius: 6px; margin: 18px 0 8px; }
+.meter .track { position: absolute; inset: 0; border-radius: 6px; }
+.meter .bound { position: absolute; top: -6px; bottom: -6px; width: 2px; background: var(--amber); }
+.meter .bound .tag {
+  position: absolute; top: -20px; right: 0; transform: translateX(50%);
+  font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: var(--amber); white-space: nowrap;
+}
+.meter .mark { position: absolute; top: 3px; bottom: 3px; width: 3px; background: var(--green); border-radius: 2px; }
+.meter .mark .tag {
+  position: absolute; top: 5px; left: 7px; white-space: nowrap;
+  font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: var(--green);
+}
+
+/* --- candidate cards --- */
+.cand { border-top: 1px solid var(--hairline); padding: 18px 0 4px; }
+.cand:last-of-type { border-bottom: 1px solid var(--hairline); }
+.cand h3 { margin-top: 0; }
+.cand .verdict-tag {
+  display: inline-block; font-family: 'IBM Plex Mono', monospace; font-size: 10.5px;
+  letter-spacing: 0.1em; text-transform: uppercase; margin-left: 8px; vertical-align: 2px;
+}
+.cand .verdict-tag.dead { color: var(--amber); }
+.cand .verdict-tag.capped { color: var(--amber); }
+.cand .verdict-tag.ref { color: var(--muted); }
+.cand .verdict-tag.adopt { color: var(--green); }
+
+/* --- code --- */
+pre {
+  background: var(--code-bg); border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 16px 18px; overflow-x: auto; margin: 14px 0;
+  font-family: 'IBM Plex Mono', monospace; font-size: 12px; line-height: 1.55;
+}
+pre code { background: none; padding: 0; }
+code {
+  font-family: 'IBM Plex Mono', monospace; font-size: 0.88em;
+  background: var(--code-bg); border: 1px solid var(--hairline);
+  border-radius: 4px; padding: 1px 5px;
+}
+.cm { color: var(--faint); }
+.figcap {
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--faint); margin: -8px 0 18px;
+}
+
+/* --- decision block --- */
+.decision {
+  background: var(--surface); border: 1px solid var(--accent); border-left: 4px solid var(--accent);
+  border-radius: 10px; padding: 22px 24px; margin: 20px 0;
+}
+.decision .stmt {
+  font-family: 'Bricolage Grotesque', 'Segoe UI', sans-serif;
+  font-size: 21px; font-weight: 700; color: var(--accent-deep); margin-bottom: 10px;
+}
+.decision ol { padding-left: 20px; color: var(--ink); }
+.decision li { margin: 5px 0; }
+.decision li::marker { color: var(--accent); font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
+
+/* --- deficit callout --- */
+.deficit {
+  background: var(--amber-bg); border: 1px solid var(--amber-line); border-radius: 10px;
+  padding: 18px 22px; margin: 20px 0;
+}
+.deficit .h {
+  font-family: 'Bricolage Grotesque', 'Segoe UI', sans-serif;
+  font-size: 15px; font-weight: 650; color: var(--amber); margin-bottom: 6px;
+}
+
+footer {
+  max-width: 720px; margin: 48px auto 64px; padding: 0 28px;
+  border-top: 1px solid var(--hairline); padding-top: 20px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: var(--faint);
+}
+footer a { color: var(--muted); }
+</style>
+
+<div class="layout">
+<nav class="toc" aria-label="Sections">
+  <div class="label">Sections</div>
+  <a href="#context">1 · Context</a>
+  <a href="#candidates">2 · Candidates</a>
+  <a href="#scorecard">3 · Scorecard</a>
+  <a href="#evidence">4 · Evidence</a>
+  <a href="#decision">5 · Decision</a>
+  <a href="#roadmap">6 · Roadmap</a>
+  <a href="#risks">7 · Risks</a>
+</nav>
+
+<main>
+<div class="hero">
+  <div class="kicker"><span class="badge">Accepted</span> ADR · 2026-09-07 · branch feature/sorage-engine</div>
+  <h1>AikoQL Storage V2 as the forward storage engine</h1>
+  <p class="deck">One application, four possible engines behind one <code>StorageEngine</code> trait. This record says which engine the project commits to — and shows every measured number behind the call, including the one axis where v2 does not win.</p>
+  <div class="meta">
+    <span><b>Status</b> · accepted (user-ratified)</span>
+    <span><b>Candidates</b> · 4</span>
+    <span><b>Evidence</b> · all measured in-repo</span>
+    <span><b>Record</b> · docs/STORAGE-ENGINE-ARCHITECTURE-DECISION.md</span>
+  </div>
+</div>
+
+<section id="context">
+  <div class="eyebrow">§ 1</div>
+  <h2>Context</h2>
+  <p>AIKOQL agent knowledge runs on a <strong>write-mixed</strong> load — ingestion, object creation, context compilation, relationship traversal; point reads are frequent but only one of eight certified shapes. The system targets bounded-RAM agent hosts, bounded restart time, and a future where sharding or replication must not force a format rewrite: the identity/placement spec (<code>logical-id-physical-id.md</code> §53) separates <em>what</em> an object is from <em>where</em> a copy lives.</p>
+  <p>The certified W1–W8 matrix — 100K knowledge objects, 20K ops per cell, page-cache-warm, p50 unless noted, release build, 2026-09-06:</p>
+  <div class="tablewrap">
+    <table>
+      <tr><th>workload</th><th class="num">memory</th><th class="num">redb</th><th class="num">aikoql v1</th><th class="num">aikoql-v2</th></tr>
+      <tr><td>W1 KO get</td><td class="num">6 µs</td><td class="num">18 µs</td><td class="num">7 µs</td><td class="num warn">34 µs</td></tr>
+      <tr><td>W2 head get</td><td class="num">6 µs</td><td class="num">9 µs</td><td class="num">6 µs</td><td class="num warn">33 µs</td></tr>
+      <tr><td>W3 version lookup</td><td class="num">9 µs</td><td class="num">12 µs</td><td class="num">9 µs</td><td class="num">43 µs</td></tr>
+      <tr><td>W3 history</td><td class="num">32 µs</td><td class="num">36 µs</td><td class="num">32 µs</td><td class="num">69 µs</td></tr>
+      <tr><td>W4 relationships F=10</td><td class="num">128 µs</td><td class="num">156 µs</td><td class="num">128 µs</td><td class="num">193 µs</td></tr>
+      <tr><td>W4 relationships F=100</td><td class="num">408 µs</td><td class="num">669 µs</td><td class="num">410 µs</td><td class="num">988 µs</td></tr>
+      <tr><td>W4 relationships F=1000</td><td class="num">3,864 µs</td><td class="num">6,617 µs</td><td class="num">3,792 µs</td><td class="num">10,581 µs</td></tr>
+      <tr><td>W5 type scan</td><td class="num">5,541 µs</td><td class="num">7,766 µs</td><td class="num">5,459 µs</td><td class="num">27,158 µs</td></tr>
+      <tr><td>W7 context compilation</td><td class="num">56 µs</td><td class="num">112 µs</td><td class="num">57 µs</td><td class="num">223 µs</td></tr>
+      <tr><td>W8 mixed 70/20/10</td><td class="num">6 µs · p99 42 µs</td><td class="num warn">13 µs · p99 31,994 µs</td><td class="num warn">9 µs · p99 31,159 µs</td><td class="num ok">45 µs · p99 978 µs</td></tr>
+      <tr><td>W6 ingestion</td><td class="num">21 µs (48,770 ops/s)</td><td class="num">2,023 µs (494 ops/s)</td><td class="num">724 µs (1,380 ops/s)</td><td class="num">728 µs (1,373 ops/s)</td></tr>
+    </table>
+  </div>
+  <p>Resources at 100K objects (post-M15/M16, 09-04):</p>
+  <div class="tablewrap">
+    <table>
+      <tr><th>backend</th><th class="num">seed wall</th><th class="num">peak RSS</th><th class="num">disk</th></tr>
+      <tr><td>aikoql-v2</td><td class="num">221.6 s</td><td class="num hi">428.05 MiB</td><td class="num hi">347.99 MiB</td></tr>
+      <tr><td>aikoql v1</td><td class="num">230.2 s</td><td class="num">611.22 MiB</td><td class="num">435.44 MiB</td></tr>
+      <tr><td>redb</td><td class="num">838.7 s</td><td class="num">513.94 MiB</td><td class="num">1.00 GiB</td></tr>
+    </table>
+  </div>
+
+  <div class="w8">
+    <h3>W8 — the workload this application actually lives on</h3>
+    <p class="note">mixed 70/20/10 · p99 tail, log scale</p>
+    <svg viewBox="0 0 600 176" role="img" aria-label="W8 p99 tail latency: aikoql-v2 978 µs, aikoql v1 31,159 µs, redb 31,994 µs">
+      <g style="stroke:var(--hairline)">
+        <line x1="129" y1="100" x2="129" y2="150"/>
+        <line x1="240" y1="100" x2="240" y2="150"/>
+        <line x1="361" y1="100" x2="361" y2="150"/>
+        <line x1="471" y1="100" x2="471" y2="150"/>
+      </g>
+      <g style="fill:var(--faint);font-family:'IBM Plex Mono',monospace;font-size:10px">
+        <text x="129" y="94" text-anchor="middle">1 ms</text>
+        <text x="240" y="94" text-anchor="middle">3 ms</text>
+        <text x="361" y="94" text-anchor="middle">10 ms</text>
+        <text x="471" y="94" text-anchor="middle">30 ms</text>
+      </g>
+      <rect x="8" y="132" width="119" height="16" rx="3" style="fill:var(--accent)"/>
+      <rect x="8" y="132" width="467" height="16" rx="3" style="fill:var(--bar-dim)"/>
+      <rect x="8" y="132" width="470" height="16" rx="3" style="fill:var(--bar-dim)"/>
+      <g style="font-family:'IBM Plex Mono',monospace;font-size:12px">
+        <text x="135" y="128" style="fill:var(--accent-deep)">978 µs</text>
+        <text x="481" y="128" style="fill:var(--muted)">31,159 µs</text>
+        <text x="484" y="128" style="fill:var(--muted)">31,994 µs</text>
+        <text x="68" y="165" text-anchor="middle" style="fill:var(--ink)">aikoql-v2</text>
+        <text x="241" y="165" text-anchor="middle" style="fill:var(--muted)">aikoql v1</text>
+        <text x="243" y="165" text-anchor="middle" style="fill:var(--muted)">redb</text>
+      </g>
+    </svg>
+    <div class="stats">
+      <div class="stat win"><div class="v">33×</div><div class="l">better tail than redb</div></div>
+      <div class="stat win"><div class="v">32×</div><div class="l">better tail than v1</div></div>
+      <div class="stat win"><div class="v">8,231 ops/s</div><div class="l">vs 1,373 / 1,476</div></div>
+    </div>
+  </div>
+</section>
+
+<section id="candidates">
+  <div class="eyebrow">§ 2</div>
+  <h2>The four candidates</h2>
+
+  <div class="cand">
+    <h3>aikoql v1 — WAL + RAM mirror<span class="verdict-tag dead">dead end</span></h3>
+    <p>Every write appends to one WAL and applies into an in-memory BTreeMap; the RAM mirror <em>is</em> the store. Measured price: open replays the whole WAL at 3.8 ms/MB (open of 100 MB = 376.7 ms) with an <strong>8.77× peak-RSS multiplier</strong>. Unbeatable warm reads — zero disk by design — and a ceiling: no dataset-larger-than-RAM capability, unbounded WAL growth, linear replay, no compaction. The W8 p99 (31.2 ms) shows the ungrouped per-commit fsync.</p>
+  </div>
+
+  <div class="cand">
+    <h3>redb — copy-on-write B-tree<span class="verdict-tag capped">capped by design</span></h3>
+    <p>Single-file MVCC B-tree, 4 KiB pages, transactional commits; recovery is open-the-file. Warm point reads are its home turf (18 µs W1 — 4 KiB pages vs v2's 64 KiB blocks is the whole story). And it is structurally capped at everything else: <strong>2.0× the disk</strong> of v2 at 100K, <strong>2.8× slower ingestion</strong> (494 vs 1,373 ops/s), <strong>33× worse mixed-write p99</strong> — every commit pays full COW + fsync. No compaction, no identity or placement concept, no sharding path in a single-file format. Its 32 ms write tail is not a bug; it is the design's price, exactly as v1's replay is the mirror's.</p>
+  </div>
+
+  <div class="cand">
+    <h3>RocksDB — C++ LSM<span class="verdict-tag ref">reference, not adopted</span></h3>
+    <p>Not measured in this repo — no backend exists, and no benchmark row is claimed. Architecture-only: v2 deliberately mirrors the industry LSM's shape (WAL + memtable, sorted runs, tiered compaction, bloom filters, block cache). What it would cost here: a C++/MSVC cross-compile in a pure-Rust codebase, duplicated cache memory, level-compaction stalls surfacing as p99 spikes, an order of magnitude more tuning surface — and the ObjectId → LogicalId → ReplicaId → PhysicalLocation hierarchy would sit <em>on top</em> as application code, not engine guarantees. The right reading: <strong>v2 is this application's Rust LSM</strong>, specialized to its actual data model — the best-practices pieces, none of the generality tax.</p>
+  </div>
+
+  <div class="cand">
+    <h3>aikoql-v2 — segmented LSM with an identity/placement layer<span class="verdict-tag adopt">adopted</span></h3>
+    <p>Group-commit WAL → memtable → immutable segments (bloom + block index + v4 dense cadence) → size-tiered compaction with relocation → identity/replica/placement directories with checkpoint-bounded recovery. Every cost axis is a <strong>tunable knob</strong>, not a design wall — the engine <code>Config</code> carries all of them: memtable bytes, durability mode, committer group window, block-cache bytes, L0 trigger, merge chunk, checkpoint budget.</p>
+  </div>
+</section>
+
+<section id="scorecard">
+  <div class="eyebrow">§ 3</div>
+  <h2>The honest scorecard</h2>
+  <p>v2's wins are decisive on the axes this application actually lives on; its deficit is one axis, precisely measured, with named levers.</p>
+  <h3>Wins vs redb</h3>
+  <p>Ingestion <strong>2.8×</strong>; mixed-workload throughput <strong>6.0×</strong> with a <strong>33× better p99 tail</strong>; peak RSS <strong>−17%</strong>; disk <strong>−65%</strong>; bounded open via the M40 checkpoint (75.0 ms vs 347.6 ms at 600K updates); dataset-larger-than-RAM queryability; a compile-time identity/placement model redb does not have.</p>
+  <h3>Wins vs v1</h3>
+  <p>Peak RSS <strong>−30%</strong>; disk <strong>−20%</strong>; mixed p99 <strong>32× better</strong> (978 µs vs 31,159 µs); ingestion at parity; bounded recovery (v1 replays the entire WAL); compaction exists (v1 has none); larger-than-RAM datasets possible (impossible in v1); placement-direct hot reads (M39 probe: 8852 s debug baseline → 3.15 s release — the same fix, both regimes measured).</p>
+
+  <div class="deficit">
+    <div class="h">The one deficit — warm point reads</div>
+    <p>6.00× v1 on W1, 5.48× on W2 — inside the amended ≤8× design gate with 1.2–1.5× headroom — and ~1.9× redb on W1. Root cause is measured, not guessed: <strong>one 64 KiB block fetch + soft-SHA-256 per cold get</strong> (~18.7 µs of the 33.5 µs get-wall), against redb's 4 KiB pages and v1's zero disk. This is the bounded-RAM trade, priced precisely.</p>
+  </div>
+
+  <p>Why the deficit is tunable, not architectural: the read path already walks memtable → placement-direct anchor → bloom → block index → bounded decode, and each stage has a shipped knob behind it — the M39 placement-direct dispatch cut the hot-key path 2,800× (O(run) → O(16) decode window), the M17 tiered path bounds segment walks, and block target, cache sizing and the batch API are named, measured levers. v1's replay and redb's write tail have no equivalent lever — they <em>are</em> the designs.</p>
+
+  <div class="meter" role="img" aria-label="Gate 5: 6.00x and 5.48x versus v1, bound 8x">
+    <div class="bound" style="right: 0%"><span class="tag">≤8× design gate</span></div>
+    <div class="mark" style="left: 68.5%"><span class="tag">W2 5.48×</span></div>
+    <div class="mark" style="left: 75%"><span class="tag">W1 6.00×</span></div>
+  </div>
+  <p class="figcap">gate 5, amended ≤2× → ≤8× (M22, user decision) · 0× at the left edge</p>
+</section>
+
+<section id="evidence">
+  <div class="eyebrow">§ 4</div>
+  <h2>Code evidence — the four properties behind the call</h2>
+
+  <h3>4.1 The hot read is placement-direct, not a scan</h3>
+  <pre><code><span class="cm">// db.rs — SE2-M39 §13: a Segment-placed replica answers placement-direct;</span>
+<span class="cm">// its anchor decodes O(RESTART_INTERVAL) entries instead of scanning</span>
+<span class="cm">// the key's whole equal-key run.</span>
+let (mem_hit, segments, direct) = {
+    let state = self.state.read().unwrap();
+    let direct = match state.placements.get(&amp;rid) {
+        Some(Placement::Segment(loc)) =&gt; state
+            .segment_records
+            .iter()
+            .position(|r| r.segment_id == loc.segment_id.0)
+            .and_then(|i| state.segments.get(i).cloned())
+            .map(|seg| (seg, *loc)),
+        _ =&gt; None,
+    };
+    <span class="cm">// …</span>
+};</code></pre>
+  <p>Resolver indirection is 500–700 ns P50 per hop; the read stays block-I/O-bound — the §12 hot-path rule honored with evidence.</p>
+
+  <h3>4.2 Recovery is bounded by a checkpoint, never by history</h3>
+  <pre><code><span class="cm">// checkpoint.rs — SE2-M40: staged write-temp → fsync → rename;</span>
+<span class="cm">// crash windows parked inside each stage by the M36 harness.</span>
+pub fn publish_staged(path: &amp;Path, checkpoint: &amp;Self, stage: Option&lt;&amp;str&gt;)
+    -&gt; Result&lt;(), FormatError&gt; { … }
+
+<span class="cm">// load_newest: newest valid checkpoint ≤ CURRENT; a name/generation</span>
+<span class="cm">// mismatch is a publication anomaly — fail closed, never pick.</span>
+<span class="cm">// Damage fails closed ALWAYS: no fallback to the deltas.</span>
+
+<span class="cm">// prune_deltas_before: delete deltas ≤ generation and older checkpoints;</span>
+<span class="cm">// a leftover is harmless — re-applying old logs is idempotent.</span></code></pre>
+  <p>Measured at 600K updates: open = checkpoint + deltas-after = <strong>75.0 ms / 1.73 MB</strong> vs full-history replay at 347.6 ms / 41.1 MB — and the checkpoint arm stays flat at live-state size while the off arm grows with every published log.</p>
+
+  <h3>4.3 The write path groups commits — the p99 nobody else matches</h3>
+  <pre><code><span class="cm">// db.rs — one fsync per group, apply-before-ack, exact-fit caps.</span>
+pub fn writer(&amp;self) -&gt; Result&lt;CommitWriter, FormatError&gt; {
+    match &amp;self.queue_tx {
+        Some(tx) =&gt; Ok(CommitWriter { tx: tx.clone() }),
+        None =&gt; Err(FormatError::Invalid(
+            "writer handles require DurabilityMode::GroupCommit".into(),
+        )),
+    }
+}
+
+fn committer_loop(rx: mpsc::Receiver&lt;Batch&gt;, wal: Arc&lt;Mutex&lt;File&gt;&gt;, …) {
+    let wait = config.max_wait_duration;
+    let mut carry: Option&lt;Batch&gt; = None;
+    loop {
+        let first = match carry.take().or_else(|| rx.recv().ok()) { … }
+        <span class="cm">// …</span>
+    }
+}</code></pre>
+  <p>The consequence is the W8 cell: p99 978 µs while both other durable engines sit at ~31–32 ms — a 32× tail-latency win that is structural, not noise.</p>
+
+  <h3>4.4 Identity is compile-time — no u64 substitution can slip through</h3>
+  <pre><code><span class="cm">// identity/logical_id.rs — the M28 spec's §28.1 requirement realized:</span>
+<span class="cm">// LogicalId(42) != ReplicaId(42) at the type level, both 8 bytes.</span>
+pub struct LogicalId(pub u64);
+pub struct ReplicaId(pub u64);
+pub struct NodeId(pub u64);
+pub struct ObjectId(pub [u8; 16]);
+
+<span class="cm">// §6.3, verbatim, as a compile_fail doc-test:</span>
+<span class="cm">// fn accepts_replica(_: ReplicaId) {}</span>
+<span class="cm">// let logical = LogicalId(42);</span>
+<span class="cm">// accepts_replica(logical);   // MUST NOT COMPILE</span></code></pre>
+  <p>This is the property that makes future replication (LogicalId + NodeId → ReplicaId per node) a data change, not a format migration.</p>
+</section>
+
+<section id="decision">
+  <div class="eyebrow">§ 5</div>
+  <h2>Decision</h2>
+  <div class="decision">
+    <div class="stmt">ADOPT AikoQL Storage V2 as the forward storage engine.</div>
+    <ol>
+      <li><strong>v2 is the strategic target and the default</strong> — ratified 2026-09-07 and shipped: a fresh <code>db_path</code> auto-creates aikoql-v2, the Python SDK defaults to <code>backend = "aikoql-v2"</code>.</li>
+      <li><strong>v1 remains available</strong> as the read-hot / RAM-affordant profile via <code>storage.backend = aikoql</code> — auto-detection makes any direction of the switch safe.</li>
+      <li><strong>redb stays the opt-out compatibility backend</strong>, not a target — snapshots and pre-flip databases keep opening as redb.</li>
+      <li><strong>RocksDB is not adopted</strong> — the reference LSM; v2 is the application-specialized Rust realization of the same architecture.</li>
+    </ol>
+  </div>
+  <p>The call rests on the axes the application lives on — write-mixed throughput, tail latency, bounded memory, bounded recovery, disk economy, and a data model that survives distribution — where v2 is at parity or decisively ahead, and on the one deficit axis being a measured, tunable trade inside the certified design gate rather than a design wall.</p>
+</section>
+
+<section id="roadmap">
+  <div class="eyebrow">§ 6</div>
+  <h2>Roadmap — closing the read cells</h2>
+  <p>Each lever measured, each with a named milestone:</p>
+  <div class="tablewrap">
+    <table>
+      <tr><th>order</th><th>lever</th><th>expected</th><th>evidence so far</th></tr>
+      <tr><td class="num">1</td><td>Adopt <code>get_many</code> in the harness W4/W7 legs</td><td>~13% p50 on the get sub-shape</td><td>M27: 0.81/0.87/0.85× stable across runs</td></tr>
+      <tr><td class="num">2</td><td>Block target 64 KiB → 16/4 KiB</td><td>~4–8× on cold/warm point gets</td><td>M22 attribution: 18.7 µs of 33.5 µs is one 64 KiB fetch</td></tr>
+      <tr><td class="num">3</td><td>Tune <code>merge_ratio</code> for scan cells</td><td>W5/history/versions 2–4×</td><td>M16: −76% merge I/O, −21% peak, gate held</td></tr>
+      <tr><td class="num">4</td><td>Cache sizing for hot datasets</td><td>converges toward v1 by configuration</td><td>gate 3 pins the knob; M19 warm regime 37 µs</td></tr>
+      <tr><td class="num">5</td><td>Paged placement directory (spec §47)</td><td>metadata beyond RAM at 10M–100M objects</td><td>M38: 419 B/object measured today</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="risks">
+  <div class="eyebrow">§ 7</div>
+  <h2>Risks and honest limits</h2>
+  <p><strong>The warm-read gap stays ~6× v1 until levers 2–4 land.</strong> Deployments that are pure read-hot and RAM-affordant should stay on <code>aikoql</code> until then. This is stated, not hidden: the amended gate is a design gate, and the 09-01 NOT ADOPT record stands in history until this ratification superseded it.</p>
+  <p><strong>RocksDB has no measured row here.</strong> The comparison against it is architectural; a rocksdb harness would be the honest way to convert that row from reasoning to evidence if it is ever wanted.</p>
+  <p><strong>The default flip is compatibility-safe by construction.</strong> Only the missing-path arm changed; existing redb files and v1 WALs keep auto-detecting to their engines, pinned byte-exact by regression tests.</p>
+</section>
+
+<footer>
+  Full record and evidence: <a href="https://github.com/anckursingh/aikoql">github.com/anckursingh/aikoql</a> — docs/STORAGE-ENGINE-ARCHITECTURE-DECISION.md · artifacts/storage-engine-v2/ · All numbers measured in-repo; nothing estimated.
+</footer>
+</main>
+</div>

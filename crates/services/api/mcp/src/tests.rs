@@ -1,4 +1,42 @@
 use crate::{model_store_dir, semantic_status_snapshot, set_semantic_status, validate_listen};
+
+// Temp db paths written by THIS test thread, swept when the thread exits
+// (the main thread's destructor runs at process exit — statics are NOT
+// dropped on Windows MSVC, TLS is).
+thread_local! {
+    static TEMP_PATHS: std::cell::RefCell<TempSweeper> =
+        const { std::cell::RefCell::new(TempSweeper { paths: Vec::new() }) };
+}
+
+struct TempSweeper {
+    paths: Vec<std::path::PathBuf>,
+}
+impl Drop for TempSweeper {
+    fn drop(&mut self) {
+        for p in &self.paths {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_dir_all(p);
+            // redb sidecar next to the registered stem (`{stem}.redb.artifacts`).
+            let Some(name) = p.file_name() else { continue };
+            if let Ok(rd) = std::fs::read_dir(p.parent().unwrap_or(std::path::Path::new("."))) {
+                let prefix = format!("{}.", name.to_string_lossy());
+                for e in rd.flatten() {
+                    if e.file_name().to_string_lossy().starts_with(&prefix) {
+                        let _ = std::fs::remove_file(e.path());
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn tmp_db(tag: &str) -> String {
+    let p = std::env::temp_dir().join(format!("mnemo-{tag}-{}.redb", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    TEMP_PATHS.with(|t| t.borrow_mut().paths.push(p.clone()));
+    p.to_string_lossy().into_owned()
+}
 #[test]
 fn model_store_dir_flag_wins() {
     let p = model_store_dir(Some("C:/tmp/models"));
@@ -140,9 +178,9 @@ fn semantic_scores_parses_caches_and_scores() {
     // scrutinee temporary, wedging the first request (and every request
     // after it) forever. This test walks both branches: parse+insert,
     // then cache-hit.
-    let db = std::env::temp_dir().join(format!("mnemo-sem-{}.redb", std::process::id()));
+    let db = tmp_db("sem");
     let _ = std::fs::remove_file(&db);
-    let engine = crate::RedbEngine::open(db.to_str().unwrap()).expect("open store");
+    let engine = crate::RedbEngine::open(&db).expect("open store");
     let k = crate::Kernel::open(
         std::sync::Arc::new(engine),
         std::sync::Arc::new(crate::SystemClock),
@@ -221,10 +259,10 @@ fn snapshot_manifest_props_carry_source_revision() {
 /// (aikoql:execution records) holds exactly one record per id.
 #[test]
 fn execute_program_idempotency_execution_id_replays() {
-    let db = std::env::temp_dir().join(format!("mnemo-prg7-{}.redb", std::process::id()));
+    let db = tmp_db("prg7");
     let _ = std::fs::remove_file(&db);
     let k = crate::Kernel::open(
-        std::sync::Arc::new(crate::RedbEngine::open(db.to_str().unwrap()).expect("open store")),
+        std::sync::Arc::new(crate::RedbEngine::open(&db).expect("open store")),
         std::sync::Arc::new(crate::SystemClock),
         0,
     )

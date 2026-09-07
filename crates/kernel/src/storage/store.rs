@@ -57,6 +57,15 @@ pub struct ConstraintCapabilities {
 
 pub trait StorageEngine: Send + Sync {
     fn get(&self, key: &[u8]) -> KResult<Option<Vec<u8>>>;
+    /// Point lookups for a batch of keys, answers parallel to the input.
+    ///
+    /// Default loops `get` — one lock/fetch per key. Engines whose per-call
+    /// overhead dominates (state locks, block fetches) override with a
+    /// batched implementation. Encrypting wrappers inherit the default and
+    /// route through their own transformed `get`.
+    fn get_many(&self, keys: &[&[u8]]) -> KResult<Vec<Option<Vec<u8>>>> {
+        keys.iter().map(|k| self.get(k)).collect()
+    }
     /// Prefix scan, sorted ascending by key.
     ///
     /// Implementations MUST seek directly to the prefix range (O(log n) +

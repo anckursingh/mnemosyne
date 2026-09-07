@@ -2,6 +2,7 @@
 //! No behavior changes.
 
 use crate::{json, Kernel, LifecycleState, Ordering, Subject, ACTIVE_CONNECTIONS, J, SERVER_START};
+use std::sync::Arc;
 pub(crate) fn tool_metrics(k: &Kernel) -> Result<J, String> {
     let (seq, _audit) = k.journal_head().map_err(|e| e.to_string())?;
     let heads = k.scan_heads().map_err(|e| e.to_string())?;
@@ -168,9 +169,17 @@ pub(crate) fn tool_backup(k: &Kernel, db_path: &str) -> Result<J, String> {
 }
 
 /// Open a backup file in a throwaway kernel and check basic integrity.
+///
+/// The snapshot format is redb regardless of the production backend
+/// (engine-independent snapshot_to — KSE-14), so verification opens the
+/// backup AS redb explicitly, never through the AIKOQL_BACKEND-selected
+/// default.
 pub(crate) fn verify_backup_file(path: &str, expected_seq: u64, expected_objects: usize) -> bool {
-    let k = match crate::engine::open_kernel_auto(path) {
-        Ok(k) => k,
+    let k = match crate::RedbEngine::open(path) {
+        Ok(e) => match Kernel::open(Arc::new(e), Arc::new(crate::SystemClock), 0xA9C9) {
+            Ok(k) => k,
+            Err(_) => return false,
+        },
         Err(_) => return false,
     };
     let (seq, _) = match k.journal_head() {

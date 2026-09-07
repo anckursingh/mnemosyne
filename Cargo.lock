@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "aikoql-benchmarks"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-compiler",
  "aikoql-graph",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "aikoql-compiler"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
  "criterion",
@@ -91,14 +91,14 @@ dependencies = [
 
 [[package]]
 name = "aikoql-graph"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
 ]
 
 [[package]]
 name = "aikoql-ingestion"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-graph",
  "aikoql-kernel",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "aikoql-kernel"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aes-gcm",
  "aikoql-compiler",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "aikoql-mcp"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-compiler",
  "aikoql-graph",
@@ -159,6 +159,8 @@ dependencies = [
  "aikoql-scheduler",
  "aikoql-semantic",
  "aikoql-sqlite",
+ "aikoql-storage",
+ "aikoql-storage-v2",
  "base64 0.22.1",
  "mongodb",
  "postgres",
@@ -174,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "aikoql-mongodb"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
  "futures-util",
@@ -184,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "aikoql-neo4j"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
  "serde",
@@ -194,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "aikoql-postgres"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
  "postgres",
@@ -202,32 +204,34 @@ dependencies = [
 
 [[package]]
 name = "aikoql-provider-sdk"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
 ]
 
 [[package]]
 name = "aikoql-proxy"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "aikoql-py"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-compiler",
  "aikoql-graph",
  "aikoql-kernel",
  "aikoql-runtime",
+ "aikoql-storage",
+ "aikoql-storage-v2",
  "pyo3",
 ]
 
 [[package]]
 name = "aikoql-reasoning"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
  "aikoql-scheduler",
@@ -235,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "aikoql-rocksdb"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
  "rocksdb",
@@ -243,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "aikoql-runtime"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
  "aikoql-semantic",
@@ -252,14 +256,14 @@ dependencies = [
 
 [[package]]
 name = "aikoql-scheduler"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
 ]
 
 [[package]]
 name = "aikoql-semantic"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
  "aikoql-scheduler",
@@ -276,15 +280,33 @@ dependencies = [
 
 [[package]]
 name = "aikoql-sqlite"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
  "rusqlite",
 ]
 
 [[package]]
+name = "aikoql-storage"
+version = "0.1.19"
+dependencies = [
+ "aikoql-kernel",
+ "aikoql-rocksdb",
+ "redb",
+]
+
+[[package]]
+name = "aikoql-storage-v2"
+version = "0.1.19"
+dependencies = [
+ "aikoql-kernel",
+ "aikoql-storage",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "aikoql-vector"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "aikoql-kernel",
  "fast-hnsw",

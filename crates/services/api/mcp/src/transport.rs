@@ -202,6 +202,9 @@ mod tcp_auth_tests {
     }
 
     fn spawn_server_with_limit(token_specs: &[&str], max_per_minute: u64) -> std::net::SocketAddr {
+        // ponytail: this db stays open in the detached listener thread for
+        // the process lifetime, so no sweeper can remove it (Windows locks
+        // the file) — a ~1.5MB pid-unique file per spawn is the accepted leak.
         let db = std::env::temp_dir().join(format!(
             "mcp-tcp-auth-{}-{}.redb",
             std::process::id(),

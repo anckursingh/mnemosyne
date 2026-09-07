@@ -14,6 +14,44 @@ use std::process::{Child, Command, Stdio};
 
 use aikoql_ingestion::{EntityCandidate, Evidence, FactCandidate, KnowledgeIr, RelationCandidate};
 
+// Temp db paths written by THIS test thread, swept when the thread exits
+// (the main thread's destructor runs at process exit — statics are NOT
+// dropped on Windows MSVC, TLS is).
+thread_local! {
+    static TEMP_PATHS: std::cell::RefCell<TempSweeper> =
+        const { std::cell::RefCell::new(TempSweeper { paths: Vec::new() }) };
+}
+
+struct TempSweeper {
+    paths: Vec<std::path::PathBuf>,
+}
+impl Drop for TempSweeper {
+    fn drop(&mut self) {
+        for p in &self.paths {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_dir_all(p);
+            // redb sidecar next to the registered stem (`{stem}.redb.artifacts`).
+            let Some(name) = p.file_name() else { continue };
+            if let Ok(rd) = std::fs::read_dir(p.parent().unwrap_or(std::path::Path::new("."))) {
+                let prefix = format!("{}.", name.to_string_lossy());
+                for e in rd.flatten() {
+                    if e.file_name().to_string_lossy().starts_with(&prefix) {
+                        let _ = std::fs::remove_file(e.path());
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn tmp_db(suffix: &str) -> String {
+    let p = std::env::temp_dir().join(format!("mcp-{suffix}-{}.redb", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    TEMP_PATHS.with(|t| t.borrow_mut().paths.push(p.clone()));
+    p.to_string_lossy().into_owned()
+}
+
 struct McpClient {
     child: Child,
     stdin: std::process::ChildStdin,
@@ -158,9 +196,9 @@ impl Drop for McpClient {
 
 #[test]
 fn real_world_agent_workflow() {
-    let db = std::env::temp_dir().join(format!("mcp-rw-{}.redb", std::process::id()));
+    let db = tmp_db("rw");
     let _ = std::fs::remove_file(&db);
-    let mut c = McpClient::start(db.to_str().unwrap());
+    let mut c = McpClient::start(&db);
 
     // ── Phase 1: Knowledge CRUD ──────────────────────────────────────────
 
@@ -431,9 +469,9 @@ fn real_world_agent_workflow() {
 /// postconditions → episode).
 #[test]
 fn critical_e2e_scenario_51_chatbot_memory() {
-    let db = std::env::temp_dir().join(format!("mcp-s51-{}.redb", std::process::id()));
+    let db = tmp_db("s51");
     let _ = std::fs::remove_file(&db);
-    let mut c = McpClient::start(db.to_str().unwrap());
+    let mut c = McpClient::start(&db);
     c.session_init("chatbot-user", "acme");
 
     // ── §51.1 Initial conversation → three durable memories ───────────────
@@ -696,9 +734,9 @@ fn critical_e2e_scenario_51_chatbot_memory() {
 /// MCP surface with mechanical judges (PR-R pattern).
 #[test]
 fn chatbot_memory_certification_scenarios() {
-    let db = std::env::temp_dir().join(format!("mcp-cmem-{}.redb", std::process::id()));
+    let db = tmp_db("cmem");
     let _ = std::fs::remove_file(&db);
-    let mut c = McpClient::start(db.to_str().unwrap());
+    let mut c = McpClient::start(&db);
     c.session_init("chatbot-user", "acme");
 
     // ── §8 CHAT-MEM-001: same-session preference recall ────────────────────
@@ -765,7 +803,7 @@ fn chatbot_memory_certification_scenarios() {
     // ── CHAT-MEM-003: persistence across server restart ────────────────────
     // Kill the server, reopen the same database, ask again.
     drop(c);
-    let mut c = McpClient::start(db.to_str().unwrap());
+    let mut c = McpClient::start(&db);
     c.session_init("chatbot-user", "acme");
     let after_restart = c.call(
         "aikoql",
@@ -1027,9 +1065,9 @@ fn chatbot_memory_certification_scenarios() {
 /// are pure-compiler tests in aikoql-ingestion's context::tests.
 #[test]
 fn ctx_differential_scenarios() {
-    let db = std::env::temp_dir().join(format!("mcp-ctx-{}.redb", std::process::id()));
+    let db = tmp_db("ctx");
     let _ = std::fs::remove_file(&db);
-    let mut c = McpClient::start(db.to_str().unwrap());
+    let mut c = McpClient::start(&db);
     c.session_init("alice", "acme");
 
     // Knowledge snapshot v1 — the same ir_json shape ingest-dir produces.
@@ -1224,9 +1262,9 @@ fn ctx_differential_scenarios() {
 
 #[test]
 fn mcp_ping_and_tools_list() {
-    let db = std::env::temp_dir().join(format!("mcp-ping-{}.redb", std::process::id()));
+    let db = tmp_db("ping");
     let _ = std::fs::remove_file(&db);
-    let mut c = McpClient::start(db.to_str().unwrap());
+    let mut c = McpClient::start(&db);
 
     // Ping
     let mut req = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
@@ -1260,9 +1298,9 @@ fn mcp_ping_and_tools_list() {
 
 #[test]
 fn mcp_idempotency_guarantee() {
-    let db = std::env::temp_dir().join(format!("mcp-idem-{}.redb", std::process::id()));
+    let db = tmp_db("idem");
     let _ = std::fs::remove_file(&db);
-    let mut c = McpClient::start(db.to_str().unwrap());
+    let mut c = McpClient::start(&db);
 
     // Create with idempotency key.
     let r1 = c.call(
@@ -1294,11 +1332,11 @@ fn mvp_rec_002_backup_destroy_restore_round_trip() {
     // MVP-QA-001 MVP-REC-002: backup → destroy → restore yields equivalent
     // knowledge — same KOID resolvable with the same content, and the
     // backup is listable.
-    let db = std::env::temp_dir().join(format!("mcp-recv-{}.redb", std::process::id()));
+    let db = tmp_db("recv");
     let _ = std::fs::remove_file(&db);
 
     // Phase 1: build knowledge.
-    let mut c = McpClient::start(db.to_str().unwrap());
+    let mut c = McpClient::start(&db);
     let note = c.call(
         "remember",
         &json!({
@@ -1369,12 +1407,13 @@ fn mvp_rec_002_backup_destroy_restore_round_trip() {
         "backup must appear in list_backups, got {names:?}"
     );
 
-    // Phase 3: destroy — kill the server, delete the database file (give
+    // Phase 3: destroy — kill the server, delete the database (a redb file
+    // pre-flip, an aikoql-v2 directory now — the 2026-09-07 default; give
     // the killed process a moment to release the handle on Windows).
     drop(c);
     let mut removed = false;
     for _ in 0..20 {
-        if std::fs::remove_file(&db).is_ok() {
+        if std::fs::remove_file(&db).is_ok() || std::fs::remove_dir_all(&db).is_ok() {
             removed = true;
             break;
         }
@@ -1383,7 +1422,7 @@ fn mvp_rec_002_backup_destroy_restore_round_trip() {
     assert!(removed, "destroy: database file must be removable");
 
     // Phase 4: fresh server on the same path (empty DB), then restore.
-    let mut c = McpClient::start(db.to_str().unwrap());
+    let mut c = McpClient::start(&db);
     let restored = c.call(
         "restore",
         &json!({"subject": "admin", "backup": &backup_dir}),
@@ -1395,7 +1434,7 @@ fn mvp_rec_002_backup_destroy_restore_round_trip() {
 
     // Phase 5: the restored file lands on reopen — restart the server.
     drop(c);
-    let mut c = McpClient::start(db.to_str().unwrap());
+    let mut c = McpClient::start(&db);
 
     // Phase 6: equivalent knowledge — same KOID, same content.
     let fetched = c.call("get", &json!({"koid": &koid, "subject": "admin"}));

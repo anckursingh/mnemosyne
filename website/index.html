@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -199,7 +199,7 @@ footer .links { margin-bottom: 12px; display: flex; gap: 20px; justify-content: 
     <div class="feature">
       <div class="icon">💾</div>
       <h3>Self-Contained Binary</h3>
-      <p>Single file: 3.4 MB (Windows), 3.7 MB (Linux musl). Zero runtime deps. Embedded redb database. CLI, server, Studio UI, and shell — all in one binary.</p>
+      <p>Single file: 3.4 MB (Windows), 3.7 MB (Linux musl). Zero runtime deps. Embedded storage: aikoql-v2 segmented LSM by default (redb / aikoql v1 as profile engines). CLI, server, Studio UI, and shell — all in one binary.</p>
     </div>
     <div class="feature">
       <div class="icon">🧩</div>
@@ -297,7 +297,7 @@ footer .links { margin-bottom: 12px; display: flex; gap: 20px; justify-content: 
 │  <span class="l3">Schema Registry · Ontology Registry · Constraint Engine</span>       │
 ├──────────────────────────────────────────────────────────────┤
 │  <span class="l4">STORAGE KERNEL</span>                                                 │
-│  <span class="l4">redb · EncryptedStore · RocksDB · MemoryEngine</span>                 │
+│  <span class="l4">aikoql-v2 LSM (default) · redb · aikoql v1 · EncryptedStore</span>     │
 └──────────────────────────────────────────────────────────────┘</code></pre></div>
   <p style="margin-top:20px;color:var(--muted);font-size:14px">
     <strong>Core principle:</strong> Everything is a Knowledge Object — data, programs, workflows, policies, agents, prompts, and connectors all share the same lifecycle: identity, versioning, provenance, access control, audit trail. Inspired by Git (objects), Kubernetes (resources), and Unix (files).
@@ -353,7 +353,7 @@ aikoql&gt; MATCH Employee EPISTEMIC verified RETURN *    # only verified knowled
 
 <section id="install">
   <h2>Get Started in 5 Seconds</h2>
-  <p class="lead">Single binary. Zero dependencies. No installers. Latest release: v0.1.18 — v0.2 (encryption) and v0.3 (knowledge lifecycle) are in the release pipeline.</p>
+  <p class="lead">Single binary. Zero dependencies. No installers. Latest release: v0.1.19 — v0.2 (encryption) and v0.3 (knowledge lifecycle) are in the release pipeline.</p>
   <div class="install-section">
     <h3>Install</h3>
     <div class="tabs">
@@ -365,16 +365,16 @@ aikoql&gt; MATCH Employee EPISTEMIC verified RETURN *    # only verified knowled
     </div>
     <div id="inst-npm"><pre><code>npm install -g aikoql-mcp
 aikoql-mcp --version</code></pre></div>
-    <div id="inst-windows" style="display:none"><pre><code>curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.18/aikoql-mcp.exe
+    <div id="inst-windows" style="display:none"><pre><code>curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.19/aikoql-mcp.exe
 .\aikoql-mcp.exe --help</code></pre></div>
-    <div id="inst-linux" style="display:none"><pre><code>curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.18/aikoql-mcp-linux-musl
+    <div id="inst-linux" style="display:none"><pre><code>curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.19/aikoql-mcp-linux-musl
 chmod +x aikoql-mcp-linux-musl && mv aikoql-mcp-linux-musl /usr/local/bin/aikoql
 aikoql --help</code></pre></div>
     <div id="inst-macos" style="display:none"><pre><code># Apple Silicon
-curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.18/aikoql-mcp-macos-arm64
+curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.19/aikoql-mcp-macos-arm64
 chmod +x aikoql-mcp-macos-arm64 && mv aikoql-mcp-macos-arm64 /usr/local/bin/aikoql
 # Intel
-curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.18/aikoql-mcp-macos
+curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.19/aikoql-mcp-macos
 chmod +x aikoql-mcp-macos && mv aikoql-mcp-macos /usr/local/bin/aikoql</code></pre></div>
     <div id="inst-source" style="display:none"><pre><code>git clone https://github.com/anckursingh/aikoql.git
 cd aikoql
@@ -387,7 +387,7 @@ cargo build --release -p aikoql-mcp
   "mcpServers": {
     "aikoql": {
       "command": "aikoql-mcp",
-      "args": ["serve", "./my-knowledge.redb"]
+      "args": ["serve", "./my-knowledge"]
     }
   }
 }</code></pre>
@@ -396,8 +396,8 @@ cargo build --release -p aikoql-mcp
   <pre><code># Interactive shell (in-memory)
 aikoql shell :memory:
 
-# Start MCP server + HTTP + Studio UI
-aikoql serve --listen 127.0.0.1:9090 --metrics-addr 127.0.0.1:9091 ./kb.redb
+# Start MCP server + HTTP + Studio UI (fresh path = aikoql-v2 database)
+aikoql serve --listen 127.0.0.1:9090 --metrics-addr 127.0.0.1:9091 ./kb
 
 # Ingest your codebase into knowledge base
 aikoql ingest-dir ~/my-project
@@ -412,7 +412,7 @@ aikoql report ~/my-project</code></pre>
     <button class="tab" onclick="showInstall('go',this)">Go</button>
   </div>
   <div id="inst-py"><pre><code>from aikoql import Agent
-db = Agent.connect("localhost:9090")  # or Agent.connect("./kb.redb")
+db = Agent.connect("localhost:9090")  # or embedded: Agent.connect("./kb") — aikoql-v2 by default
 db.remember({"type_name": "Note", "properties": {"body": "Hello aikoql"}})
 result = db.query("MATCH Note RETURN *")</code></pre></div>
   <div id="inst-ts" style="display:none"><pre><code>import { AikoqlClient } from 'aikoql-sdk';
@@ -460,6 +460,8 @@ result, _ := client.Remember(map[string]interface{}{"type_name": "Note"})</code>
     <a href="/docs/getting-started">Getting Started</a>
     <a href="/docs/api-reference">API Reference</a>
     <a href="/docs/architecture">Architecture</a>
+    <a href="/docs/benchmarks">Benchmarks</a>
+    <a href="/docs/development">Development</a>
     <a href="https://github.com/anckursingh/aikoql" target="_blank">GitHub</a>
     <a href="https://www.npmjs.com/package/aikoql-mcp" target="_blank">npm</a>
     <a href="/docs/guides/programs">Programs-as-KOs</a>

@@ -25,6 +25,41 @@ jobs:
       - run: cargo test --workspace -- --ignored --test-threads=1
         timeout-minutes: 30
 
+      # Smoke pass of the minute-scale suites per-push CI skips (ci.yml):
+      # the same regression net, weekly, release mode.
+      - name: Skipped-by-CI suites — smoke (release)
+        run: |
+          cargo test --release -p aikoql-storage \
+            --test kse_m7_workloads \
+            --test kse120c_writer_contention \
+            --test kse6_relationship_locality \
+            && cargo test --release -p aikoql-storage-v2 \
+              --test kse_m7_v2_workloads \
+              --test merged_scan \
+            && cargo test --release -p aikoql-ingestion --test wave31_scale
+        timeout-minutes: 60
+
+      # KSE-12 property gate (MRFC-KSE-001 §18): ≥10,000 generated op
+      # sequences, six invariants asserted after every sequence. The test
+      # fails if KSE12_NIGHTLY is set but not honored (strict opt-in).
+      - name: KSE-12 property-based storage testing (10,000 sequences)
+        run: KSE12_NIGHTLY=1 cargo test --release -p aikoql-storage --test kse12_property
+        timeout-minutes: 60
+
+      # KSE-13 concurrency gate (MRFC-KSE-001 §19 KSE-120): 256 readers /
+      # 32 writers on the doc workloads, five expecteds. Strict opt-in.
+      - name: KSE-13 concurrency stress (256 readers / 32 writers)
+        run: KSE13_NIGHTLY=1 cargo test --release -p aikoql-storage --test kse13_concurrency
+        timeout-minutes: 60
+
+      # KSE-19 resource usage (MRFC-KSE-001 §25): RSS/heap/disk at 100K and
+      # 1M KOs via the loader child + PowerShell-independent sampler logic
+      # (the test's own sampler is Windows-only; on Linux the loader still
+      # runs and the report carries heap/disk without RSS). Strict opt-in.
+      - name: KSE-19 resource usage (100K + 1M KOs)
+        run: KSE19_NIGHTLY=1 cargo test --release -p aikoql-storage --test kse19_resource
+        timeout-minutes: 90
+
       # R14: run all criterion benches, save results under the `ci` baseline.
       # Bench targets are enumerated so the criterion flags don't reach
       # libtest bench targets ("Unrecognized option: 'save-baseline'").

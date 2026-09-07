@@ -78,7 +78,7 @@ Knowledge Runtime (Compiler → KVM · Orchestrator · Policy Engine)
         ↓
 Knowledge Kernel (MVCC · OCC · HLC · RBAC · Audit · CDC · Epistemic · Valid-Time · Evidence)
         ↓
-Storage Kernel (redb · EncryptedStore)
+Storage Kernel (aikoql-v2 LSM · redb · EncryptedStore)
 ```
 
 **Everything is a Knowledge Object.** Data, programs, workflows, policies, triggers, agents — unified lifecycle.
@@ -88,6 +88,8 @@ Storage Kernel (redb · EncryptedStore)
 - [Getting Started](/docs/getting-started) — Install and run in 5 minutes
 - [API Reference](/docs/api-reference) — All MCP tools + 40+ REST endpoints
 - [Architecture](/docs/architecture) — Deep dive into the Knowledge OS
+- [Benchmarks](/docs/benchmarks) — Certified cross-engine matrix (W1–W8 + resources)
+- [Development](/docs/development) — Build, test and extend from source
 - [Programs-as-KOs](/docs/guides/programs) — Deploy, execute, version, audit
 - [Encryption](/docs/guides/encryption) — AES-256-GCM setup and key management
 - [Import Data](/docs/guides/import) — PostgreSQL, SQLite, MongoDB, Neo4j connectors

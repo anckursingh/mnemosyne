@@ -33,6 +33,7 @@ use crate::knowledge::kom::*;
 use crate::knowledge::notify::{EventFilter, SubscriptionRecord};
 use crate::storage::cache::KnowledgeCache;
 use crate::storage::store::{StorageEngine, WriteBatch};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 const P_OBJ: &[u8] = b"ko/";
@@ -302,6 +303,19 @@ fn decode_sub(buf: &[u8]) -> KResult<SubscriptionRecord> {
     Ok(SubscriptionRecord { filter, last_seq })
 }
 
+/// KSE-10 report of a derived-index rebuild: the exact image of the
+/// canonical heads, plus what the sweep removed.
+pub struct DerivedIndexRebuild {
+    pub heads_scanned: usize,
+    pub relo_rows: usize,
+    pub reli_rows: usize,
+    pub type_rows: usize,
+    /// Rows removed that decoded fine but referenced nothing canonical.
+    pub removed_stale: usize,
+    /// Rows removed that failed key decode (corrupt index entries).
+    pub removed_invalid: usize,
+}
+
 /// The kernel's storage boundary. Hides key layout and low-level encoding.
 pub struct KnowledgeRepository {
     engine: Arc<dyn StorageEngine>,
@@ -424,6 +438,80 @@ impl KnowledgeRepository {
         batch.put(K_TYPE_INDEX.to_vec(), vec![]);
     }
 
+    /// KSE-10: rebuild all derived indexes (relo/reli/type) from canonical
+    /// state. The ko/ heads are the authority; every derived row is
+    /// recomputed as their exact image and the symmetric difference is
+    /// applied in ONE batch (disjoint put/del key sets, so the engine's
+    /// puts-before-dels order cannot cross a del with a put).
+    /// ponytail: O(derived-index) memory for the two key sets — rebuild is a
+    /// repair op, not a hot path.
+    pub fn rebuild_derived_indexes(&self) -> KResult<DerivedIndexRebuild> {
+        let mut old: HashSet<Vec<u8>> = HashSet::new();
+        let mut removed_invalid = 0usize;
+        for (key, _v) in self.engine().scan(P_REL_OUT)? {
+            if decode_rel_out_key(&key).is_err() {
+                removed_invalid += 1;
+            }
+            old.insert(key);
+        }
+        for (key, _v) in self.engine().scan(P_REL_IN)? {
+            if decode_rel_in_key(&key).is_err() {
+                removed_invalid += 1;
+            }
+            old.insert(key);
+        }
+        for (key, _v) in self.engine().scan(P_TYPE)? {
+            if key.len() < P_TYPE.len() + 1 + KOID_LEN {
+                removed_invalid += 1;
+            }
+            old.insert(key);
+        }
+
+        let mut new: HashSet<Vec<u8>> = HashSet::new();
+        let mut relo_rows = 0usize;
+        let mut reli_rows = 0usize;
+        let mut type_rows = 0usize;
+        let heads = self.scan_heads()?;
+        let heads_scanned = heads.len();
+        for (koid, _version, ts, _state) in heads {
+            let Some(ko) = self.get_object_version(&koid, ts)? else {
+                continue; // head without a version row — canonical corruption, not derivable
+            };
+            for rel in &ko.relationships {
+                let (src, dst) = match rel.direction {
+                    Direction::Outbound => (koid, rel.target),
+                    Direction::Inbound => (rel.target, koid),
+                };
+                new.insert(rel_out_key(&src, &rel.rel_type, &dst));
+                new.insert(rel_in_key(&dst, &rel.rel_type, &src));
+                relo_rows += 1;
+                reli_rows += 1;
+            }
+            new.insert(type_key(&ko.metadata.type_name, &koid));
+            type_rows += 1;
+        }
+
+        let removed = old.difference(&new).count();
+        let mut batch = WriteBatch::new();
+        for key in old.difference(&new) {
+            batch.del(key.clone());
+        }
+        for key in new.difference(&old) {
+            batch.put(key.clone(), vec![]);
+        }
+        if !batch.is_empty() {
+            self.write_batch(&batch)?;
+        }
+        Ok(DerivedIndexRebuild {
+            heads_scanned,
+            relo_rows,
+            reli_rows,
+            type_rows,
+            removed_stale: removed - removed_invalid,
+            removed_invalid,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Schemas (REC-002: persisted so backup/restore preserves constraints)
     // -----------------------------------------------------------------------
@@ -522,6 +610,75 @@ impl KnowledgeRepository {
         } else {
             Ok(None)
         }
+    }
+
+    /// SE2-M25 — batch head resolution, cache-aware parity with `get_head`:
+    /// cache hits answer in place, misses go through one engine `get_many`.
+    pub fn get_heads_many(
+        &self,
+        koids: &[KOID],
+    ) -> KResult<Vec<Option<(u64, u64, LifecycleState)>>> {
+        let mut out: Vec<Option<(u64, u64, LifecycleState)>> = vec![None; koids.len()];
+        let mut misses: Vec<(usize, Vec<u8>)> = Vec::with_capacity(koids.len());
+        for (i, koid) in koids.iter().enumerate() {
+            if let Some(c) = &self.cache {
+                if let Some(head) = c.get_head(koid) {
+                    out[i] = Some(head);
+                    continue;
+                }
+            }
+            misses.push((i, head_key(koid)));
+        }
+        if misses.is_empty() {
+            return Ok(out);
+        }
+        let keys: Vec<&[u8]> = misses.iter().map(|(_, k)| k.as_slice()).collect();
+        let results = self.engine().get_many(&keys)?;
+        for ((i, _), res) in misses.into_iter().zip(results) {
+            if let Some(b) = res {
+                let head = decode_head(&b)?;
+                if let Some(c) = &self.cache {
+                    c.put_head(&koids[i], head.0, head.1, head.2);
+                }
+                out[i] = Some(head);
+            }
+        }
+        Ok(out)
+    }
+
+    /// SE2-M25 — batch object-version loads, cache-aware parity with
+    /// `get_object_version`: cache hits answer in place, misses go through
+    /// one engine `get_many`.
+    pub fn get_object_versions_many(
+        &self,
+        koids_and_ts: &[(KOID, u64)],
+    ) -> KResult<Vec<Option<KnowledgeObject>>> {
+        let mut out: Vec<Option<KnowledgeObject>> = vec![None; koids_and_ts.len()];
+        let mut misses: Vec<(usize, Vec<u8>)> = Vec::with_capacity(koids_and_ts.len());
+        for (i, (koid, ts)) in koids_and_ts.iter().enumerate() {
+            if let Some(c) = &self.cache {
+                if let Some(ko) = c.get_object(koid, *ts) {
+                    out[i] = Some(ko);
+                    continue;
+                }
+            }
+            misses.push((i, obj_key(koid, *ts)));
+        }
+        if misses.is_empty() {
+            return Ok(out);
+        }
+        let keys: Vec<&[u8]> = misses.iter().map(|(_, k)| k.as_slice()).collect();
+        let results = self.engine().get_many(&keys)?;
+        for ((i, _), res) in misses.into_iter().zip(results) {
+            if let Some(b) = res {
+                let ko = codec::decode_ko_wire(&b)?;
+                if let Some(c) = &self.cache {
+                    c.put_object(&koids_and_ts[i].0, koids_and_ts[i].1, &ko);
+                }
+                out[i] = Some(ko);
+            }
+        }
+        Ok(out)
     }
 
     pub fn get_object_at(&self, koid: &KOID, snap_ts: u64) -> KResult<Option<KnowledgeObject>> {

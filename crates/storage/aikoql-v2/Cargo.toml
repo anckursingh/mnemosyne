@@ -1,0 +1,20 @@
+[package]
+name = "aikoql-storage-v2"
+description = "AIKOQL v2 storage engine (SE2) — segmented WAL, immutable segments, manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aikoql-kernel = { path = "../../kernel" }
+# SE2-M3: legacy WAL migration rides v1's validated envelope parser; the
+# frozen batch-payload codec is re-implemented in migration.rs.
+aikoql-storage = { path = "../aikoql" }
+# SE2-M15: the streamed publish hashes the file as it writes (the whole-file
+# checksum8 the manifest record stores) — same crate/version kernel uses.
+# SE2-M22 — the fast backends were surveyed and rejected: 0.10 `compress` is
+# an empty stub; `asm` (sha2-asm) ships GAS .S sources that MSVC cannot
+# assemble; 0.11 `x86-sha` demands compile-time `target_feature=sha` (crashes
+# non-SHA CPUs). Soft sha2 stays (~10 µs/16 KiB — the miss-path floor).
+sha2 = "0.10"

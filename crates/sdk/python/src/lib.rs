@@ -7,10 +7,13 @@
 //! these primitives (`aikoql.checkpointer`).
 
 use aikoql_graph::{GraphEngineApi, RelateRequest, TraverseQuery};
+use aikoql_kernel::storage::store::StorageEngine;
 use aikoql_kernel::{
     Fusion, Kernel, KnowledgeContext, Metadata, RedbEngine, RememberRequest, ScoredKO,
     SemanticBlock, SimilarityQuery, Subject, SystemClock, Value, KOID,
 };
+use aikoql_storage::AikoqlStorageEngine;
+use aikoql_storage_v2::AikoqlStorageEngineV2;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -153,11 +156,22 @@ pub struct Aikoql {
 #[pymethods]
 impl Aikoql {
     #[new]
-    #[pyo3(signature = (path, salt = 0))]
-    fn new(path: &str, salt: u64) -> PyResult<Self> {
-        let engine = RedbEngine::open(path).map_err(to_pyerr)?;
-        let kernel =
-            Kernel::open(Arc::new(engine), Arc::new(SystemClock), salt).map_err(to_pyerr)?;
+    #[pyo3(signature = (path, salt = 0, backend = "aikoql-v2"))]
+    fn new(path: &str, salt: u64, backend: &str) -> PyResult<Self> {
+        // Default: aikoql-v2, the ratified production default (2026-09-07
+        // ADR). "aikoql" and "redb" open existing databases; the migration
+        // path is the REC-002 backup/restore flow.
+        let engine: Arc<dyn StorageEngine> = match backend {
+            "aikoql-v2" => Arc::new(AikoqlStorageEngineV2::open(path).map_err(to_pyerr)?),
+            "aikoql" => Arc::new(AikoqlStorageEngine::open(path).map_err(to_pyerr)?),
+            "redb" => Arc::new(RedbEngine::open(path).map_err(to_pyerr)?),
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown backend {other:?}: use \"aikoql-v2\", \"aikoql\" or \"redb\""
+                )))
+            }
+        };
+        let kernel = Kernel::open(engine, Arc::new(SystemClock), salt).map_err(to_pyerr)?;
         Ok(Aikoql {
             inner: Arc::new(kernel),
         })

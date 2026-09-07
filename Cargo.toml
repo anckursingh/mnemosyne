@@ -25,10 +25,12 @@ members = [
     "crates/providers/mongodb",
     "crates/providers/neo4j",
     "crates/storage/rocksdb",
+    "crates/storage/aikoql",
+    "crates/storage/aikoql-v2",
 ]
 
 [workspace.package]
-version = "0.1.18"
+version = "0.1.19"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/anckursingh/aikoql"

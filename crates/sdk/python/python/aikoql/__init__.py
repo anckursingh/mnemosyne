@@ -4,8 +4,8 @@ Unified interface for AI agents. Supports embedded (PyO3) and server (MCP) modes
 
     from aikoql import Agent
 
-    # Embedded mode (in-process):
-    db = Agent.connect("./kb.redb")
+    # Embedded mode (in-process); a fresh path creates an aikoql-v2 database:
+    db = Agent.connect("./kb")
 
     # Server mode (talks to aikoql-mcp over TCP):
     db = Agent.connect("localhost:9090")

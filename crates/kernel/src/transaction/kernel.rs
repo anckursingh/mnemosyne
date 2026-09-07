@@ -34,6 +34,7 @@ use crate::security::crypto::Crypto;
 use crate::security::envelope::{Envelope, CRYPTO_META_KEY, CRYPTO_META_V1, DEKS_STORAGE_KEY};
 use crate::security::field_crypto::{ComplianceSummary, EncryptionPolicy, FieldCrypto};
 use crate::security::tenant::TenantManager;
+pub use crate::storage::repository::DerivedIndexRebuild;
 use crate::storage::repository::KnowledgeRepository;
 use crate::storage::store::{ConstraintCapabilities, StorageEngine, WriteBatch};
 use std::collections::{HashMap, HashSet};
@@ -2171,6 +2172,12 @@ impl Kernel {
                 req.origin.clone(),
                 r.op.context.subject.name.clone(),
                 req.note.clone(),
+                // prev rels for the phase-3 index diff (unrelate sweep) —
+                // mirror of commit_version's QA2-PROP-002 invariant.
+                r.head
+                    .as_ref()
+                    .map(|h| h.relationships.clone())
+                    .unwrap_or_default(),
             ));
         }
 
@@ -2196,7 +2203,7 @@ impl Kernel {
         let mut results = Vec::with_capacity(pending.len());
         let mut prev_audit = pipe.audit;
         let start_seq = pipe.seq;
-        for (idx, (koid, cur_v, mut ko, kind, origin, actor, note)) in
+        for (idx, (koid, cur_v, mut ko, kind, origin, actor, note, prev_rels)) in
             pending.into_iter().enumerate()
         {
             let seq = start_seq + idx as u64 + 1;
@@ -2240,6 +2247,34 @@ impl Kernel {
                 .put_object_version(&mut batch, &koid, commit_ts, &ko);
             self.repo
                 .put_head(&mut batch, &koid, ko.version, commit_ts, ko.lifecycle.state);
+            // Relationship + type index maintenance — the same invariant
+            // commit_version upholds (QA2-PROP-002): index rows are atoms of
+            // the same batch as the version row, so the index can never
+            // drift from the head, across a crash or otherwise.
+            for rel in &ko.relationships {
+                let (src, dst) = match rel.direction {
+                    Direction::Outbound => (koid, rel.target),
+                    Direction::Inbound => (rel.target, koid),
+                };
+                self.relationships
+                    .write_index(&mut batch, &src, &rel.rel_type, &dst);
+            }
+            let mut removed: Vec<RelationshipRef> = prev_rels.to_vec();
+            for rel in &ko.relationships {
+                if let Some(i) = removed.iter().position(|p| p == rel) {
+                    removed.swap_remove(i);
+                }
+            }
+            for rel in &removed {
+                let (src, dst) = match rel.direction {
+                    Direction::Outbound => (koid, rel.target),
+                    Direction::Inbound => (rel.target, koid),
+                };
+                self.relationships
+                    .delete_index(&mut batch, &src, &rel.rel_type, &dst);
+            }
+            self.repo
+                .write_type_index(&mut batch, &ko.metadata.type_name, &koid);
             self.repo.put_event(&mut batch, seq, &ke);
             events.push(ke);
             prev_audit = audit;
@@ -2608,6 +2643,37 @@ impl Kernel {
             }
         }
         Ok(ko)
+    }
+
+    /// SE2-M25 — batch KO lookups under one auth guard; the same rules as
+    /// per-target `get` (a missing KO fails the whole batch with NotFound,
+    /// per-object field decryption).
+    pub fn get_many(
+        &self,
+        ctx: impl Into<KnowledgeContext>,
+        koids: &[KOID],
+    ) -> KResult<Vec<KnowledgeObject>> {
+        let ctx = ctx.into();
+        let mut kos = self.objects.get_many(koids)?;
+        {
+            let auth = self.auth.read().unwrap();
+            for ko in &kos {
+                auth.authorize(&ctx.subject, ko, Action::Read)?;
+            }
+        }
+        // Field-level decryption (MRFC-0020 Phase 3), one policy lock for
+        // the batch.
+        if let Some(ref fc) = self.field_crypto {
+            let policies = self.encryption_policies.read().unwrap();
+            let tenant = ctx.tenant.as_deref().unwrap_or("default");
+            for ko in &mut kos {
+                if let Some(policy) = policies.get(&ko.metadata.type_name) {
+                    fc.decrypt_fields(tenant, &ko.metadata.type_name, &mut ko.properties, policy)
+                        .map_err(|e| KError::Store(format!("field decrypt: {}", e)))?;
+                }
+            }
+        }
+        Ok(kos)
     }
 
     pub fn get_at(
@@ -3185,6 +3251,13 @@ impl Kernel {
     /// after restore.
     pub fn restore_store_from(&self, path: &std::path::Path) -> KResult<()> {
         self.store.restore_from(path)
+    }
+
+    /// KSE-10: rebuild the derived indexes (relo/reli/type) from canonical
+    /// ko/ heads. Repair op — repairs stale, missing, or corrupt derived
+    /// rows in one atomic batch; canonical knowledge is never touched.
+    pub fn rebuild_derived_indexes(&self) -> KResult<DerivedIndexRebuild> {
+        self.repo.rebuild_derived_indexes()
     }
 
     // ---- Programs-as-KOs (MRFC-0030 Phase 7a) ----------------------------

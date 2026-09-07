@@ -21,7 +21,7 @@
 mod common;
 
 use aikoql_ingestion::{merge_knowledge_ir, KnowledgeIr, MockEmbeddingProvider};
-use common::trackb::{corpus, Question};
+use common::trackb::corpus;
 use common::wave31_sim::{
     agent_policy, aikoql_context, generate, rag_context, sample_tasks, union_docs, union_questions,
     unsupported_tokens, win_zone, AgentOutcome, REPS,

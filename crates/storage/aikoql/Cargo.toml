@@ -1,0 +1,22 @@
+[package]
+name = "aikoql-storage"
+description = "AIKOQL-native storage engine (MRFC-KSE-001) — implements the StorageEngine trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aikoql-kernel = { path = "../../kernel" }
+# KSE-5 harness: RocksDB comparison is a strict opt-in (librocksdb-sys is a
+# multi-minute build) — the harness reports NOT_MEASURED without it, never a
+# silent skip.
+aikoql-rocksdb = { path = "../rocksdb", optional = true }
+
+[dev-dependencies]
+# KSE-5 harness: redb stats for the locality comparison.
+redb = "2"
+
+[features]
+default = []
+kse5-rocksdb = ["dep:aikoql-rocksdb"]

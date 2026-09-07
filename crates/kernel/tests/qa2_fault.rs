@@ -12,6 +12,27 @@ use aikoql_kernel::*;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Temp paths created by THIS thread, swept when the thread exits (the main
+// thread's destructor runs at process exit — statics are NOT dropped on
+// Windows MSVC, TLS is). Kill-harness children never register a path they
+// received via env, so the parent's evidence survives its child.
+thread_local! {
+    static TEMP_PATHS: std::cell::RefCell<TempSweeper> =
+        const { std::cell::RefCell::new(TempSweeper { paths: Vec::new() }) };
+}
+
+struct TempSweeper {
+    paths: Vec<std::path::PathBuf>,
+}
+impl Drop for TempSweeper {
+    fn drop(&mut self) {
+        for p in &self.paths {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+}
+
 fn mk(engine: Arc<MemoryEngine>) -> Kernel {
     Kernel::open(engine, Arc::new(ManualClock::new(10_000)), 0xC0FFEE).unwrap()
 }
@@ -47,6 +68,7 @@ fn tmp_path(tag: &str) -> std::path::PathBuf {
             .unwrap()
             .as_nanos()
     ));
+    TEMP_PATHS.with(|t| t.borrow_mut().paths.push(p.clone()));
     p
 }
 
