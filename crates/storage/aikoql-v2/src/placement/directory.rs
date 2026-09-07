@@ -266,10 +266,17 @@ impl PlacementLog {
     pub fn publish_staged(path: &Path, log: &Self, stage: Option<&str>) -> Result<(), FormatError> {
         publish_atomic_staged(path, &log.encode(), stage)
     }
+
+    /// SE2-M40 — encoded byte length without encoding (the checkpoint
+    /// trigger's budget).
+    pub fn encoded_len(&self) -> usize {
+        HEADER_LEN + self.records.len() * PLACEMENT_RECORD_LEN + 8
+    }
 }
 
 /// Parse the generation out of a `PLACEMENT-{gen:06}.log` name.
-fn log_generation(name: &str) -> Option<u64> {
+/// SE2-M40 — pub(crate), the checkpoint pruner shares it.
+pub(crate) fn placement_log_generation(name: &str) -> Option<u64> {
     name.strip_prefix("PLACEMENT-")
         .and_then(|s| s.strip_suffix(".log"))
         .and_then(|g| g.parse::<u64>().ok())
@@ -290,7 +297,7 @@ pub fn load_placement_logs(
         .flatten()
     {
         let name = entry.file_name();
-        let Some(gen) = log_generation(&name.to_string_lossy()) else {
+        let Some(gen) = placement_log_generation(&name.to_string_lossy()) else {
             continue;
         };
         if gen <= current_generation {
@@ -324,7 +331,7 @@ pub fn orphan_placement_logs(dir: &Path, current_generation: u64) -> Vec<u64> {
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(gen) = log_generation(&name.to_string_lossy()) else {
+        let Some(gen) = placement_log_generation(&name.to_string_lossy()) else {
             continue;
         };
         if gen > current_generation {
@@ -333,6 +340,41 @@ pub fn orphan_placement_logs(dir: &Path, current_generation: u64) -> Vec<u64> {
     }
     orphans.sort_unstable();
     orphans
+}
+
+/// SE2-M40 — the highest placement generation inside the ORPHAN placement
+/// logs (gens > CURRENT, the §24 state-C window of a compaction). The
+/// relocation records do NOT ride the WAL, so the recovered map never sees
+/// them — but the numbers were durably published and must never be handed
+/// out again (review INV-05). The allocator seeds past this maximum.
+/// Best-effort: orphans are non-authoritative (recovery must not fail on
+/// them — cp009), so an undecodable orphan warns and contributes nothing.
+pub fn orphan_placement_max_generation(dir: &Path, current_generation: u64) -> u64 {
+    let mut max = 0u64;
+    for gen in orphan_placement_logs(dir, current_generation) {
+        let bytes = match std::fs::read(placement_log_path(dir, gen)) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "aikoql-v2: orphan PLACEMENT-{gen:06}.log unreadable ({e}); \
+                     allocator cannot see its generations"
+                );
+                continue;
+            }
+        };
+        match PlacementLog::decode(&bytes) {
+            Ok(log) => {
+                for rec in &log.records {
+                    max = max.max(rec.placement.generation());
+                }
+            }
+            Err(e) => eprintln!(
+                "aikoql-v2: orphan PLACEMENT-{gen:06}.log not decodable ({e}); \
+                 allocator cannot see its generations"
+            ),
+        }
+    }
+    max
 }
 
 /// The in-memory placement directory: the gate-protected map plus the

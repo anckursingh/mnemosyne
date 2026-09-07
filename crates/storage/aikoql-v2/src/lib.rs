@@ -22,6 +22,7 @@
 //! becomes the production default only on ADOPT.
 
 pub mod cache;
+pub mod checkpoint;
 pub mod compaction;
 pub mod db;
 pub mod engine;

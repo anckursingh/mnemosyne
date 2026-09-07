@@ -137,3 +137,49 @@ Universal General-Purpose Database Storage Engine
 Certified strengths: agent memory, Knowledge Objects, repository knowledge, code intelligence, document knowledge, ontology-driven applications, medium-scale knowledge graphs, local/embedded deployments.
 
 Not yet certified: unbounded historical datasets, multi-terabyte storage, very high concurrent writes, general-purpose OLTP workloads.
+
+## V2 Hardening Review — SE2-M40 (2026-09-07)
+
+Review: `AIKOQL_Storage_V2_Immediate_Hardening_Physical_Resolution_TDD.md` (in `E:\downloads`). Its P0-1/P0-2 (bounded recovery + crash-safe checkpoint publication) are exactly the v1 closure's published limitation — full history replay at open — reappearing in the v2 directory metadata; P0-3 (explicit generation allocation) extends INV-05. The review's M1–M4 and M8–M11 were already shipped by SE2-M29–M39 (identity/placement directories, crash injection, recovery, relocation stress, randomized oracle); this pass closed M5–M7 + M12 as SE2-M40 and wrote the §16 challenge dispositions with evidence.
+
+### §16 Challenge dispositions (written reasoning as the review mandates)
+
+- **Challenge A — Is `PhysicalHandle` justified? REJECTED on evidence.** The proposed §5 `PhysicalHandle` is a rename of state the shipped `Placement` enum already resolves (`Memtable` / `Segment(PhysicalLocation)` / `Retired`, SE2-M32). M39's direct-read certification measured the resolver at 500–700 ns P50 — no hotspot a repr-transparent wrapper would fix — and M21's attribution attributed the point-read cost to block I/O (21.4 µs of 39.5 µs), not metadata resolution. The correctness risk the handle names (physical location validity) is already enforced by `validate_segment_location` + the fail-closed decode paths.
+- **Challenge B — Checkpoint topology: coordinated, one file.** The identity, replica, and placement directories are ONE consistency domain — a flush publishes all three at the same manifest generation, so per-directory checkpoints would still need a joint marker to be atomic. One `CHECKPOINT-{gen:06}.log` snapshot at one generation wins on publish count (one atomic rename), atomicity (no cross-file crash state), and prune simplicity (one `generation ≤ G` cut).
+- **Challenge C — Generation authority: real defect, fixed.** The pgen orphan-burn window: a state-C orphan PLACEMENT log (SE2-M35's after_location crash) can carry a pgen that the allocator re-issues for a later relocation — INV-05's "generations never silently reused" violated. Fix: `orphan_placement_max_generation(dir, current)` folds orphan placement pgens into the replay seed at open, so the next published generation strictly exceeds every orphaned one. ckp006 pins it, RED-verified (the test fails against the pre-fix allocator).
+- **Challenge D — Compaction ordering: already shipped, no change.** The §7 required ordering (segment write → relocation PLACEMENT log → manifest → CURRENT → retire) is exactly the shipped publication order — certified by SE2-M35's cp009/cp010 state-C/state-D pins and SE2-M36's seven-window crash matrix.
+
+### Milestone dispositions
+
+| Milestone | Disposition |
+|---|---|
+| M1 generation allocator | shipped SE2-M30 (allocators resume at max+1 across restart) |
+| M2 PhysicalHandle type safety | REJECTED (Challenge A — the `Placement` enum already resolves) |
+| M3 physical directory | shipped SE2-M32 (placement directory) |
+| M4 placement → handle → location | shipped SE2-M32/M33 (enum resolution + memtable integration) |
+| M5 checkpoint writer | shipped SE2-M40 ckp001/ckp002 (golden + replay equivalence) |
+| M6 delta replay | shipped SE2-M40 ckp002/ckp005 (checkpoint ≡ full-replay byte equality) |
+| M7 crash-safe checkpoint rotation | shipped SE2-M40 ckp004 (five crash windows) |
+| M8 compaction relocation | shipped SE2-M35 |
+| M9 post-flush write regression | shipped SE2-M39 (oracle caught 2 defects, pd002 pins) |
+| M10 compaction restart regression | shipped SE2-M37/SE2-M38 |
+| M11 randomized oracle | shipped SE2-M39 (20k ops + 3 crash windows, zero divergence) |
+| M12 directory growth certification | shipped SE2-M40 ckp008 |
+
+### M12 gate — measured (release, 2026-09-07)
+
+The review's gate: recovery must not grow linearly with total historical metadata mutations once checkpointing is active. At 600K updates over 10K objects (`ckp008_growth_probe`, `SE2M40_NIGHTLY=1`; artifact `artifacts/storage-engine-v2/directory-checkpoint.md`):
+
+| arm | metadata bytes | log files | warm open |
+|---|---|---|---|
+| checkpointing off | 41,077,878 | 303 | 347.6 ms |
+| checkpoint budget 2 MiB | 1,734,216 | 7 | 75.0 ms |
+
+The off arm's open climbs with the update count (every published log is decoded); the checkpoint arm's stays flat at the live-state size (~10K identity/replica records + the trigger window of placement records). Open is now proportional to checkpoint + deltas-after — 4.6× faster warm open and 23.7× less metadata at the measured ceiling. Residual open-time growth is the segment set (identical across arms), not the directory.
+
+### Review Definition of Done
+
+- Correctness: generation allocation restart-safe (SE2-M30, ckp006); never silently reused (ckp006, RED-verified); checkpoint + delta recovery (ckp002/ckp005); all checkpoint crash points (ckp004); invalid references fail closed (ckp001 damage matrix); post-flush and compaction/restart regressions (SE2-M39, SE2-M37/M38); randomized oracle (SE2-M39).
+- Scalability: checkpointing implemented, historical replay bounded, obsolete deltas pruned (ckp005: 0 surviving logs at the trigger), recovery benchmark produced, recovery not proportional to metadata history (M12 table).
+- Performance: direct reads bounded (SE2-M39: read P50 14.7 µs at 8.5 decodes); resolver overhead measured (500–700 ns P50 — the Challenge A evidence); hot-path regression within the amended gate (SE2-M39 §44: −2.9/−2.9/−1.1% vs baseline, bounds 10/10/15%); no segment scan introduced; bounded entry decode preserved (SE2-M34 mt007/§11 pin).
+- Architecture: ObjectId/LogicalId/ReplicaId stability re-pinned by the M38 100k stress and the M39 oracle; physical relocation never rewrites logical identity (SE2-M35); the physical layer supports future remote locations by construction (the `Placement` enum's variant space, no remote variant implemented — per the review's §18).

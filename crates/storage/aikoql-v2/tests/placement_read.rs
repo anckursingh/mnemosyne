@@ -8,9 +8,9 @@
 //! rid-filtered scan decodes ~n entries for the tail replica.
 
 use aikoql_storage_v2::db::{Config, Db};
-use aikoql_storage_v2::identity::ObjectId;
 use aikoql_storage_v2::identity::directory::{IdentityResolver, LocalIdentityDirectory};
 use aikoql_storage_v2::identity::topology::{LocalReplicaDirectory, ReplicaDirectory};
+use aikoql_storage_v2::identity::ObjectId;
 use aikoql_storage_v2::placement::directory::{
     LocalPlacementResolver, Placement, PlacementResolver,
 };

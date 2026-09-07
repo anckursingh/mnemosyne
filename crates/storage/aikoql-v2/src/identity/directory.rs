@@ -126,6 +126,12 @@ impl IdentityLog {
     pub fn publish(path: &Path, log: &Self) -> Result<(), FormatError> {
         publish_atomic(path, &log.encode())
     }
+
+    /// SE2-M40 — encoded byte length without encoding (the checkpoint
+    /// trigger's budget).
+    pub fn encoded_len(&self) -> usize {
+        HEADER_LEN + self.records.len() * IDENTITY_RECORD_LEN + 8
+    }
 }
 
 impl ReplicaLog {
@@ -188,9 +194,24 @@ impl ReplicaLog {
     pub fn publish(path: &Path, log: &Self) -> Result<(), FormatError> {
         publish_atomic(path, &log.encode())
     }
+
+    /// SE2-M40 — encoded byte length without encoding (the checkpoint
+    /// trigger's budget).
+    pub fn encoded_len(&self) -> usize {
+        HEADER_LEN + self.records.len() * REPLICA_RECORD_LEN + 8
+    }
 }
 
 /// Parse the generation out of a `STEM-{gen:06}.log` name.
+pub(crate) fn identity_log_generation(name: &str) -> Option<u64> {
+    log_generation(name, "IDENTITY-")
+}
+
+/// SE2-M40 — the replica stem, shared with the checkpoint pruner.
+pub(crate) fn replica_log_generation(name: &str) -> Option<u64> {
+    log_generation(name, "REPLICA-")
+}
+
 fn log_generation(name: &str, stem: &str) -> Option<u64> {
     name.strip_prefix(stem)
         .and_then(|s| s.strip_suffix(".log"))
@@ -211,7 +232,7 @@ pub fn load_identity_logs(
         .flatten()
     {
         let name = entry.file_name();
-        let Some(gen) = log_generation(&name.to_string_lossy(), "IDENTITY-") else {
+        let Some(gen) = identity_log_generation(&name.to_string_lossy()) else {
             continue;
         };
         if gen <= current_generation {
@@ -245,7 +266,7 @@ pub fn load_replica_logs(
         .flatten()
     {
         let name = entry.file_name();
-        let Some(gen) = log_generation(&name.to_string_lossy(), "REPLICA-") else {
+        let Some(gen) = replica_log_generation(&name.to_string_lossy()) else {
             continue;
         };
         if gen <= current_generation {

@@ -309,8 +309,7 @@ impl SegmentWriter {
                 // SE2-M39 — v4 encodes a full key at EVERY cadence point
                 // (the dense table's decode bases): the cadence entry must
                 // stand alone, so shared = 0 there even mid-run.
-                let is_dense =
-                    v4 && (i - start).is_multiple_of(RESTART_INTERVAL as usize);
+                let is_dense = v4 && (i - start).is_multiple_of(RESTART_INTERVAL as usize);
                 // After a split the entry encodes with shared = 0 (the new
                 // block's prev is None) — recomputed like the encode pass,
                 // not from the split estimate above.
@@ -503,7 +502,9 @@ impl SegmentWriter {
                         6 + 4 * restarts.len()
                     };
                     for &pos in &restarts {
-                        table.extend_from_slice(&((table_prefix + pos as usize) as u32).to_le_bytes());
+                        table.extend_from_slice(
+                            &((table_prefix + pos as usize) as u32).to_le_bytes(),
+                        );
                     }
                     if v4 {
                         table.extend_from_slice(&(dense.len() as u32).to_le_bytes());
@@ -823,8 +824,8 @@ impl SegmentReader {
             // bloom stay version 1. Anything else fails closed: a valid
             // checksum is a future format (Unsupported), a stale one is
             // damage (Corrupt).
-            let in_set = version == SEGMENT_VERSION
-                || ((2..=4).contains(&version) && kind == BLOCK_DATA);
+            let in_set =
+                version == SEGMENT_VERSION || ((2..=4).contains(&version) && kind == BLOCK_DATA);
             if !in_set {
                 if version == 0 {
                     return Err(FormatError::Corrupt("block version 0".into()));
@@ -1512,9 +1513,9 @@ impl SegmentReader {
                 if table_len + 4 > payload.len() {
                     return Err(FormatError::Corrupt("v4 table exceeds payload".into()));
                 }
-                let dense = u32::from_le_bytes(
-                    payload[table_len..table_len + 4].try_into().expect("u32"),
-                ) as usize;
+                let dense =
+                    u32::from_le_bytes(payload[table_len..table_len + 4].try_into().expect("u32"))
+                        as usize;
                 table_len += 4 + 4 * dense;
                 if table_len > payload.len() {
                     return Err(FormatError::Corrupt(
@@ -1612,8 +1613,7 @@ impl SegmentReader {
             return Err(FormatError::Corrupt("v4 table exceeds payload".into()));
         }
         let dense =
-            u32::from_le_bytes(payload[table_len..table_len + 4].try_into().expect("u32"))
-                as usize;
+            u32::from_le_bytes(payload[table_len..table_len + 4].try_into().expect("u32")) as usize;
         table_len += 4 + 4 * dense;
         if table_len > payload.len() {
             return Err(FormatError::Corrupt(
@@ -1628,9 +1628,8 @@ impl SegmentReader {
             return Ok(None);
         }
         let offs = &payload[6 + 4 * restarts + 4..table_len];
-        let start = u32::from_le_bytes(
-            offs[cadence * 4..cadence * 4 + 4].try_into().expect("u32"),
-        ) as usize;
+        let start = u32::from_le_bytes(offs[cadence * 4..cadence * 4 + 4].try_into().expect("u32"))
+            as usize;
         let end = if cadence + 1 < dense {
             u32::from_le_bytes(
                 offs[(cadence + 1) * 4..(cadence + 1) * 4 + 4]
@@ -1945,12 +1944,7 @@ fn skip_entry_body(cur: &mut Cursor<'_>, v3: bool) -> Result<(), FormatError> {
 /// scan path never validated the table either; a valid-checksum lying
 /// table is a malicious-writer case. Full-table validation stays where it
 /// exists (block_get_v2); add it here if a v2 table is ever found corrupt.
-fn scan_seek_pos(
-    payload: &[u8],
-    v2: bool,
-    v4: bool,
-    start: &[u8],
-) -> Result<usize, FormatError> {
+fn scan_seek_pos(payload: &[u8], v2: bool, v4: bool, start: &[u8]) -> Result<usize, FormatError> {
     if !v2 {
         return Ok(0);
     }
@@ -1968,9 +1962,8 @@ fn scan_seek_pos(
         if table_len + 4 > payload.len() {
             return Err(FormatError::Corrupt("v4 table exceeds payload".into()));
         }
-        let dense = u32::from_le_bytes(
-            payload[table_len..table_len + 4].try_into().expect("u32"),
-        ) as usize;
+        let dense =
+            u32::from_le_bytes(payload[table_len..table_len + 4].try_into().expect("u32")) as usize;
         table_len += 4 + 4 * dense;
         if table_len > payload.len() {
             return Err(FormatError::Corrupt(

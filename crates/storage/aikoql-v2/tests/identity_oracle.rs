@@ -23,9 +23,7 @@ use std::time::{Duration, Instant};
 use aikoql_storage_v2::db::{Config, Db};
 use aikoql_storage_v2::identity::topology::{LocalReplicaDirectory, ReplicaDirectory};
 use aikoql_storage_v2::identity::{LogicalId, ObjectId};
-use aikoql_storage_v2::placement::directory::{
-    LocalPlacementResolver, PlacementResolver,
-};
+use aikoql_storage_v2::placement::directory::{LocalPlacementResolver, PlacementResolver};
 
 mod common;
 use common::dir;
@@ -169,9 +167,7 @@ fn plan(oracle: &mut Oracle, seed: u64, i: usize, ops: usize) -> Plan {
                 .unwrap();
             let key = oracle.map.get(&oid).unwrap().last_key.clone();
             let entry = oracle.map.get_mut(&oid).unwrap();
-            entry
-                .rows
-                .insert(key.clone(), (None, entry.version + 1));
+            entry.rows.insert(key.clone(), (None, entry.version + 1));
             entry.version += 1;
             Plan::Delete(oid, key)
         }
@@ -240,10 +236,10 @@ fn verify(db: &Db, oracle: &Oracle, seed: u64, at: &str) {
             let got = db.get_object(*oid, key).unwrap();
             if got.as_deref() != value.as_deref() {
                 let lid = db.resolve_object(*oid);
-                let rid = lid
-                    .and_then(|l| LocalReplicaDirectory::new(db).resolve_local(l).unwrap());
-                let placement = rid
-                    .and_then(|r| LocalPlacementResolver::new(db).resolve(r).unwrap());
+                let rid =
+                    lid.and_then(|l| LocalReplicaDirectory::new(db).resolve_local(l).unwrap());
+                let placement =
+                    rid.and_then(|r| LocalPlacementResolver::new(db).resolve(r).unwrap());
                 panic!(
                     "value/version divergence at {at}: {oid:?} key {key:?}\n  \
                      expected {value:?}\n  got {got:?}\n  \
@@ -379,11 +375,8 @@ fn oracle_child() {
     // Ack marker: the engine's Sync ack for op `ops` IS durable, so the
     // marker appearing after it means the parent may kill us — then park
     // until the kill (with a generous self-exit against a leaked child).
-    let marker = std::fs::File::create(PathBuf::from(format!(
-        "{}.acked-{ops}",
-        d.display()
-    )))
-    .unwrap();
+    let marker =
+        std::fs::File::create(PathBuf::from(format!("{}.acked-{ops}", d.display()))).unwrap();
     marker.sync_all().unwrap();
     let deadline = Instant::now() + Duration::from_secs(1200);
     while Instant::now() < deadline {
@@ -407,7 +400,5 @@ fn or001_randomized_oracle() {
             crash_window(&d, seed, *k);
         }
     }
-    println!(
-        "or001 PASS — {ops} ops, oracle rows verified value/identity/version/existence"
-    );
+    println!("or001 PASS — {ops} ops, oracle rows verified value/identity/version/existence");
 }

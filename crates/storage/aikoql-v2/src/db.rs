@@ -29,6 +29,9 @@
 //! Drop does NOT flush — recovery is the WAL's job.
 
 use crate::cache::{BlockCache, CacheStats};
+use crate::checkpoint::{
+    checkpoint_path, directory_log_bytes, load_newest, prune_deltas_before, DirectoryCheckpoint,
+};
 use crate::compaction::{merge, CompactStats, KeepAll, RetentionPolicy};
 use crate::format::{
     crash_park, verify_pair, Current, FormatError, Manifest, SegmentRecord, FORMAT_VERSION,
@@ -42,8 +45,9 @@ use crate::identity::topology::{LocalReplicaDirectory, ReplicaDirectory};
 use crate::identity::{LogicalId, NodeId, ObjectId, ReplicaId, LOCAL_NODE_ID};
 use crate::memtable::Memtable;
 use crate::placement::directory::{
-    load_placement_logs, merge_placement, orphan_placement_logs, placement_log_path,
-    validate_segment_location, PhysicalLocation, Placement, PlacementLog, PlacementRecord,
+    load_placement_logs, merge_placement, orphan_placement_logs, orphan_placement_max_generation,
+    placement_log_path, validate_segment_location, PhysicalLocation, Placement, PlacementLog,
+    PlacementRecord,
 };
 use crate::placement::{BlockId, SegmentId};
 use crate::segment::{
@@ -90,6 +94,16 @@ const DEFAULT_L0_TIER_RATIO: usize = 1;
 /// datasets produce one chunk either way — every pre-M20 pin holds at the
 /// 64 MiB default.
 const DEFAULT_MERGE_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+/// SE2-M40 — directory checkpoint trigger: once the identity/replica/
+/// placement delta logs accumulated since the last checkpoint reach this
+/// many bytes, the flush/compact that crossed the line publishes a
+/// checkpoint of the live directories and prunes the subsumed history
+/// (review P0-1: recovery ≈ checkpoint + recent deltas, never the full
+/// metadata history). 0 disables checkpoints (full replay forever — the
+/// tests' pinned regime). 16 MiB keeps recovery's replay tail under
+/// ~16 MiB at any scale while the measured 100K-object directory history
+/// (14.7 MB, SE2-M39) stays below the trigger — existing pins hold.
+const DEFAULT_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn manifest_path(dir: &Path, generation: u64) -> PathBuf {
     dir.join(format!("MANIFEST-{generation:06}"))
@@ -144,6 +158,9 @@ pub struct Config {
     /// cap instead of the whole merged dataset. 0 = one unbounded segment
     /// (the pre-M20 shape).
     pub merge_chunk_bytes: usize,
+    /// SE2-M40 — directory checkpoint trigger in accumulated delta-log
+    /// bytes (see DEFAULT_CHECKPOINT_BYTES). 0 disables checkpoints.
+    pub checkpoint_bytes: usize,
 }
 
 impl Config {
@@ -160,6 +177,7 @@ impl Config {
             l0_compact_trigger: DEFAULT_L0_COMPACT_TRIGGER,
             l0_tier_ratio: DEFAULT_L0_TIER_RATIO,
             merge_chunk_bytes: DEFAULT_MERGE_CHUNK_BYTES,
+            checkpoint_bytes: DEFAULT_CHECKPOINT_BYTES,
         }
     }
 }
@@ -202,6 +220,12 @@ struct State {
     placements: HashMap<ReplicaId, Placement>,
     pending_placements: Vec<PlacementRecord>,
     next_placement_generation: u64,
+    /// SE2-M40 — directory delta-log bytes published since the last
+    /// checkpoint (seeded at open from the logs after the newest
+    /// checkpoint, incremented per published log). The flush/compact that
+    /// crosses `Config::checkpoint_bytes` publishes a checkpoint and
+    /// prunes the subsumed history.
+    bytes_since_checkpoint: u64,
 }
 
 /// One queued batch waiting on its group: the ops plus the ack channel
@@ -272,14 +296,33 @@ impl Db {
         // report-and-ignore newer orphans (a crash between log publish and
         // CURRENT, the §24 state-C window: the WAL still holds the frames,
         // so replay rebuilds the same records).
+        // SE2-M40 — when a checkpoint exists, its snapshot seeds the maps
+        // and only the logs published AFTER it replay (review INV-09):
+        // recovery is checkpoint + recent deltas, never the full history.
+        let checkpoint = load_newest(&config.dir, current.manifest_generation)?;
+        let checkpoint_generation = checkpoint.as_ref().map_or(0, |c| c.generation);
         let mut identity: HashMap<ObjectId, LogicalId> = HashMap::new();
         let mut replicas: HashMap<LogicalId, ReplicaId> = HashMap::new();
+        if let Some(ckp) = &checkpoint {
+            for rec in &ckp.identities {
+                merge_identity(&mut identity, rec.oid, rec.lid)?;
+            }
+            for rec in &ckp.replicas {
+                merge_replica(&mut replicas, rec.lid, rec.node, rec.rid)?;
+            }
+        }
         for log in load_identity_logs(&config.dir, current.manifest_generation)? {
+            if log.generation <= checkpoint_generation {
+                continue; // subsumed by the checkpoint
+            }
             for rec in &log.records {
                 merge_identity(&mut identity, rec.oid, rec.lid)?;
             }
         }
         for log in load_replica_logs(&config.dir, current.manifest_generation)? {
+            if log.generation <= checkpoint_generation {
+                continue; // subsumed by the checkpoint
+            }
             for rec in &log.records {
                 merge_replica(&mut replicas, rec.lid, rec.node, rec.rid)?;
             }
@@ -329,11 +372,27 @@ impl Db {
         // orphans are reported and ignored (the §24 state-C window: the
         // WAL still holds the ops, replay rebuilds the same records).
         let mut placements: HashMap<ReplicaId, Placement> = HashMap::new();
+        if let Some(ckp) = &checkpoint {
+            for rec in &ckp.placements {
+                merge_placement(&mut placements, rec.rid, rec.placement)?;
+            }
+        }
         for log in load_placement_logs(&config.dir, current.manifest_generation)? {
+            if log.generation <= checkpoint_generation {
+                continue; // subsumed by the checkpoint
+            }
             for rec in &log.records {
                 merge_placement(&mut placements, rec.rid, rec.placement)?;
             }
         }
+        // SE2-M40 — the §24 state-C window of a COMPACTION burns placement
+        // generations the map never sees (relocation records do not ride
+        // the WAL): the recovered allocator must stay above the orphan
+        // logs' records too, or the next compaction would re-hand those
+        // numbers (review INV-05 / Challenge C). Best-effort — orphans are
+        // non-authoritative and must not fail the open (cp009).
+        let orphan_pgen_max =
+            orphan_placement_max_generation(&config.dir, current.manifest_generation);
         let segment_ids: HashSet<u64> = manifest.segments.iter().map(|s| s.segment_id).collect();
         for (rid, p) in &placements {
             if let Placement::Segment(loc) = p {
@@ -389,11 +448,15 @@ impl Db {
         // SE2-M39 — replayed object writes re-apply their placement flips;
         // the flip allocator recovers past the logged records (the State's
         // value is the post-loop recovery past everything replayed).
+        // SE2-M40 — the seed also clears the orphan logs' burned
+        // generations (Challenge C): a replayed flip must never re-hand a
+        // number a state-C compaction already durably published.
         let mut replay_pgen = placements
             .values()
             .map(|p| p.generation())
             .max()
             .unwrap_or(0)
+            .max(orphan_pgen_max)
             + 1;
         for frame in &frames {
             for op in &frame.ops {
@@ -478,13 +541,22 @@ impl Db {
         let next_replica_id = replicas.values().map(|r| r.0).max().unwrap_or(0) + 1;
         // SE2-M32 — placement generations recover past the newest applied
         // record (logs + replayed WAL); the gate ignores anything older,
-        // so the map maximum IS the maximum ever allocated.
+        // so the map maximum IS the maximum ever allocated. SE2-M40 — the
+        // orphan logs' burned generations clear too (Challenge C): a
+        // generation durably published in a state-C window is never
+        // re-handed (INV-05), however invisible its records are to the
+        // recovered map.
         let next_placement_generation = placements
             .values()
             .map(|p| p.generation())
             .max()
             .unwrap_or(0)
+            .max(orphan_pgen_max)
             + 1;
+        // SE2-M40 — the checkpoint trigger's budget resumes from the bytes
+        // published after the newest checkpoint (leftover pre-checkpoint
+        // logs are dead weight the next prune sweeps, not replay work).
+        let bytes_since_checkpoint = directory_log_bytes(&config.dir, checkpoint_generation)?;
 
         let wal = Arc::new(Mutex::new(wal));
         let state = Arc::new(RwLock::new(State {
@@ -504,6 +576,7 @@ impl Db {
             placements,
             pending_placements,
             next_placement_generation,
+            bytes_since_checkpoint,
         }));
         let fsyncs = Arc::new(AtomicU64::new(0));
         let (queue_tx, committer) = if config.durability == DurabilityMode::GroupCommit {
@@ -887,9 +960,11 @@ impl Db {
             } else if let Some(e) = state.active.get_by_rid(key, rid) {
                 Some(e.value.clone())
             } else {
-                state.immutables.iter().rev().find_map(|mem| {
-                    mem.get_by_rid(key, rid).map(|e| e.value.clone())
-                })
+                state
+                    .immutables
+                    .iter()
+                    .rev()
+                    .find_map(|mem| mem.get_by_rid(key, rid).map(|e| e.value.clone()))
             };
             (mem_hit, Arc::clone(&state.segments), direct)
         };
@@ -1411,6 +1486,8 @@ impl Db {
                 generation: state.generation,
                 records: std::mem::take(&mut state.pending_identity),
             };
+            // SE2-M40 — the checkpoint trigger's budget.
+            state.bytes_since_checkpoint += log.encoded_len() as u64;
             IdentityLog::publish(&identity_log_path(&config.dir, state.generation), &log)?;
         }
         if !state.pending_replicas.is_empty() {
@@ -1419,6 +1496,7 @@ impl Db {
                 generation: state.generation,
                 records: std::mem::take(&mut state.pending_replicas),
             };
+            state.bytes_since_checkpoint += log.encoded_len() as u64;
             ReplicaLog::publish(&replica_log_path(&config.dir, state.generation), &log)?;
         }
         if !state.pending_placements.is_empty() {
@@ -1427,6 +1505,7 @@ impl Db {
                 generation: state.generation,
                 records: std::mem::take(&mut state.pending_placements),
             };
+            state.bytes_since_checkpoint += log.encoded_len() as u64;
             PlacementLog::publish(&placement_log_path(&config.dir, state.generation), &log)?;
         }
         crash_park("AIKOQL_V2_FLUSH_PARK", &config.dir, "after_identity");
@@ -1451,6 +1530,14 @@ impl Db {
         // make_mut: in-flight gets holding a clone keep their snapshot —
         // the new segments land in the fresh vec only.
         Arc::make_mut(&mut state.segments).extend(new_segments);
+        // SE2-M40 — the checkpoint rides AFTER CURRENT (it adds no crash
+        // state — see checkpoint.rs): the flush that crossed the trigger
+        // publishes the live directories and prunes the subsumed history.
+        if config.checkpoint_bytes > 0
+            && state.bytes_since_checkpoint >= config.checkpoint_bytes as u64
+        {
+            Self::write_checkpoint(config, state)?;
+        }
         Ok(())
     }
 
@@ -1592,6 +1679,8 @@ impl Db {
                 generation: state.generation,
                 records: placement_records.clone(),
             };
+            // SE2-M40 — the checkpoint trigger's budget.
+            state.bytes_since_checkpoint += log.encoded_len() as u64;
             // SE2-M36 — staged: the §38 LOCATION windows park inside.
             PlacementLog::publish_staged(
                 &placement_log_path(&self.config.dir, state.generation),
@@ -1645,7 +1734,43 @@ impl Db {
                 );
             }
         }
+        // SE2-M40 — the relocation log's bytes count toward the trigger;
+        // a compaction-heavy workload checkpoints without any flush.
+        if self.config.checkpoint_bytes > 0
+            && state.bytes_since_checkpoint >= self.config.checkpoint_bytes as u64
+        {
+            Self::write_checkpoint(&self.config, &mut state)?;
+        }
         Ok(stats)
+    }
+
+    /// SE2-M40 — the checkpoint publication protocol (review P0-2):
+    /// publish (atomic, staged for the crash matrix) → VERIFY by reading
+    /// the file back → prune the subsumed delta history and older
+    /// checkpoints. Runs inside the state lock at the end of the flush or
+    /// compaction that crossed the trigger, at the CURRENT generation.
+    fn write_checkpoint(config: &Config, state: &mut State) -> Result<(), FormatError> {
+        let checkpoint = DirectoryCheckpoint::from_state(
+            state.generation,
+            &state.identity,
+            &state.replicas,
+            &state.placements,
+        );
+        let path = checkpoint_path(&config.dir, state.generation);
+        DirectoryCheckpoint::publish_staged(&path, &checkpoint, Some("CHECKPOINT"))?;
+        // Verify publication before anything depends on it: the history is
+        // only pruned after the checkpoint proves decodable.
+        let read_back = DirectoryCheckpoint::read(&path)?;
+        if read_back != checkpoint {
+            return Err(FormatError::Corrupt(
+                "checkpoint read-back differs from the published bytes".into(),
+            ));
+        }
+        crash_park("AIKOQL_V2_CKP_PARK", &config.dir, "after_checkpoint");
+        prune_deltas_before(&config.dir, state.generation)?;
+        crash_park("AIKOQL_V2_CKP_PARK", &config.dir, "after_prune");
+        state.bytes_since_checkpoint = 0;
+        Ok(())
     }
 }
 
