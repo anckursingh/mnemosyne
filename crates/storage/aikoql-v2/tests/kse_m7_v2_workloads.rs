@@ -66,6 +66,7 @@ use std::process::{Command, Stdio};
 const NIGHTLY_ENV: &str = "V2ADOPT_NIGHTLY";
 const LOADER_ENV: &str = "V2ADOPT_LOADER";
 const LOADER_BACKEND_ENV: &str = "V2ADOPT_LOADER_BACKEND";
+const BACKEND_ENV: &str = "V2ADOPT_BACKEND";
 const SEED: u64 = 0x27_0000;
 const N_TYPES: usize = 100;
 const DEEP_VERSIONS: usize = 10; // "10+ versions each" (§27 W3)
@@ -104,12 +105,62 @@ fn size() -> Size {
             ops: 20_000,
             scan_rounds: 10,
         },
-        other => panic!("{NIGHTLY_ENV} strict opt-in: unset or 1, got {other:?}"),
+        // SE2-M28 scale certification: the 1M matrix (ratios preserved —
+        // ops = n/5, deep = n/10 → W7 = 50K ops, W6 = 2,800,003 commits).
+        Ok(v) if v == "1m" => Size {
+            n: 1_000_000,
+            deep: 100_000,
+            ops: 200_000,
+            scan_rounds: 10,
+        },
+        other => panic!("{NIGHTLY_ENV} strict opt-in: unset, 1, or 1m, got {other:?}"),
     }
 }
 
 fn nightly() -> bool {
-    std::env::var(NIGHTLY_ENV).is_ok_and(|v| v == "1")
+    std::env::var(NIGHTLY_ENV).is_ok_and(|v| v == "1" || v == "1m")
+}
+
+/// The report's scale label (benchmark_report + the gate-5 row).
+fn scale_label() -> &'static str {
+    match std::env::var(NIGHTLY_ENV).as_deref() {
+        Ok("1") => "V2ADOPT_NIGHTLY",
+        Ok("1m") => "V2ADOPT_NIGHTLY=1m",
+        _ => "smoke",
+    }
+}
+
+/// Single-backend filter (SE2-M28 staged runs): unset = the full
+/// four-backend matrix; one of the four names = that backend only.
+fn backend_filter() -> Option<String> {
+    let v = match std::env::var(BACKEND_ENV) {
+        Err(std::env::VarError::NotPresent) => return None,
+        Err(e) => panic!(
+            "{BACKEND_ENV} strict opt-in: unset, memory, redb, aikoql, or aikoql-v2, got {e:?}"
+        ),
+        Ok(v) => v,
+    };
+    match v.as_str() {
+        "memory" | "redb" | "aikoql" | "aikoql-v2" => Some(v),
+        other => panic!(
+            "{BACKEND_ENV} strict opt-in: unset, memory, redb, aikoql, or aikoql-v2, got {other}"
+        ),
+    }
+}
+
+/// Artifact filename suffix: "" at 100K (canonical), "-1m" at 1M, plus
+/// "-<backend>" when the run is filtered — a filtered run never clobbers
+/// the canonical artifacts or the unfiltered scale artifacts.
+fn artifact_suffix(filter: Option<&str>) -> String {
+    let mut s = String::new();
+    if std::env::var(NIGHTLY_ENV).as_deref() == Ok("1m") {
+        s.push_str("-1m");
+    }
+    if let Some(b) = filter {
+        s.push('-');
+        s.push_str(b);
+    }
+    s
 }
 
 fn alice() -> Subject {
@@ -656,8 +707,14 @@ fn gate_cell(g: Option<bool>) -> &'static str {
 /// The verdict is nightly-gated; the ratios are reported on every run.
 /// Shared by the report and result.json (SE-11) so they cannot drift.
 fn gate5_evidence(backends: &[BackendResult]) -> (Option<bool>, Option<f64>, Option<f64>) {
-    let v2 = backends.iter().find(|b| b.name == "aikoql-v2").unwrap();
-    let aik = backends.iter().find(|b| b.name == "aikoql").unwrap();
+    // A filtered run (V2ADOPT_BACKEND) may lack either half of the pair —
+    // then there is no verdict, and the cell reads NOT_EVIDENCED.
+    let (Some(v2), Some(aik)) = (
+        backends.iter().find(|b| b.name == "aikoql-v2"),
+        backends.iter().find(|b| b.name == "aikoql"),
+    ) else {
+        return (None, None, None);
+    };
     let (r1, r2) = (
         p50_ratio(v2, aik, "KO get (W1)"),
         p50_ratio(v2, aik, "head get (W2)"),
@@ -669,24 +726,32 @@ fn gate5_evidence(backends: &[BackendResult]) -> (Option<bool>, Option<f64>, Opt
     (verdict, r1, r2)
 }
 
-fn benchmark_report(backends: &[BackendResult], sz: Size) -> String {
+fn benchmark_report(backends: &[BackendResult], sz: Size, filter: Option<&str>) -> String {
     let profile = if cfg!(debug_assertions) {
         "debug (CPU inflated; RSS comparable — kse19)"
     } else {
         "release"
     };
-    let scale = if nightly() {
-        "V2ADOPT_NIGHTLY"
-    } else {
-        "smoke"
-    };
+    let scale = scale_label();
     let (gate5, r1, r2) = gate5_evidence(backends);
+    let filter_note = match filter {
+        Some(b) => format!(
+            "Single-backend run ({BACKEND_ENV}={b} — SE2-M28 staged): the matrix holds one row; gate 5 is decided across the aikoql-v2 and aikoql runs' cells.\n"
+        ),
+        None => String::new(),
+    };
+    let scale_ref = if sz.n == 1_000_000 {
+        "- 1M/10M ingestion scale: v1 1M creates = 1242 s / 645 B per KO heap (KSE-19, measured). v2 at 1M: measured by this run (workloads-1m.md, SE2-M28).\n"
+    } else {
+        "- 1M/10M ingestion scale: v1 1M creates = 1242 s / 645 B per KO heap (KSE-19, measured). v2 at 1M NOT_MEASURED.\n"
+    };
 
     let mut s = String::new();
     let date = run_date();
     s.push_str(&format!(
         "# W1..W8 Workloads — v2 vs redb vs v1 (MRFC-KSE-001 §27-28 + design §26)\n\n\
          Date: {date} · profile: {profile} · seed {SEED:#x} · scale: {} KOs / {} deep × {} versions / {} ops ({scale} — strict opt-in)\n\n\
+         {filter_note}\
          The same workload shapes v1's M7 adoption ran, on the same seed. All workloads through the Kernel on `&dyn StorageEngine` (§32). One seeded dataset per backend.\n\n",
         sz.n, sz.deep, DEEP_VERSIONS, sz.ops,
     ));
@@ -713,18 +778,18 @@ fn benchmark_report(backends: &[BackendResult], sz: Size) -> String {
          | 2. dataset larger than RAM remains queryable | PASS | `v2_gate2_3_dataset_larger_than_ram` (this suite): ~820 KB dataset under a 64 KiB memtable + zero cache → served from on-disk segments, full scan byte-exact, survives reopen |\n\
          | 3. memory limits configurable | PASS | the same probe pins both knobs: `memtable_bytes=64 KiB` forced flushes (≥2 SEGMENT files); `cache_bytes=0` detaches the cache (silent stats), a 4 KiB cap is consulted (misses) yet holds nothing (oversize block never retained) |\n\
          | 4. group commit improves concurrent throughput without weakening Sync | — | SE2-M6 suite green (Sync baseline reproduced exactly); throughput evidence = the `SE2M6_NIGHTLY=1` matrix → artifacts/storage-engine-v2/group-commit.md |\n\
-         | 5. KO lookup competitive with the MVP baseline (v1) | {} | W1 {:.2}× v1, W2 {:.2}× v1 (P50; bound ≤ {GATE5_SLOWDOWN_BOUND}× — perf verdict only at V2ADOPT_NIGHTLY=1, this run is {scale}) |\n",
+         | 5. KO lookup competitive with the MVP baseline (v1) | {} | W1 {:.2}× v1, W2 {:.2}× v1 (P50; bound ≤ {GATE5_SLOWDOWN_BOUND}× — perf verdict only on a real (non-smoke) matrix run; this run is {scale}) |\n",
         gate_cell(gate5),
         r1.unwrap_or(0.0),
         r2.unwrap_or(0.0),
     ));
     s.push_str("\n## Reference rows (not re-measured here)\n\n");
-    s.push_str(
+    s.push_str(&format!(
         "- snapshot: v2 rides the trait defaults (redb snapshot — REC-002); v1 byte-exact restore pinned (KSE-14); redb single-file opens as redb.\n\
          - recovery: v2 real-kill recovery pinned by the SE2-M3/M4/M6 suites (recovery-independence.md); v1 by KSE-15.\n\
          - concurrent mixed load: v2 pinned behaviorally by the SE2-M6 group-commit suite (KSE-13 order); v1 by KSE-13. W8 above is the single-threaded mixed row.\n\
-         - 1M/10M ingestion scale: v1 1M creates = 1242 s / 645 B per KO heap (KSE-19, measured). v2 at 1M NOT_MEASURED.\n",
-    );
+         {scale_ref}",
+    ));
     s.push_str("\n## Honest metric mapping\n\n");
     s.push_str(
         "- throughput/latency: per-op wall on one thread; percentiles over the instrumented pass (P50/P95/P99 in µs)\n\
@@ -870,7 +935,7 @@ fn filesystem(dir: &Path) -> String {
 /// automated comparison of the runs that decide V2 adoption. Only the
 /// suite's own knobs are reported as env vars — a full environment dump
 /// would leak credentials (e.g. AIKOQL_TCP_TOKEN).
-fn result_json(backends: &[BackendResult], sz: Size) -> String {
+fn result_json(backends: &[BackendResult], sz: Size, filter: Option<&str>) -> String {
     let args = std::env::args().collect::<Vec<_>>().join(" ");
     let (gate5, r1, r2) = gate5_evidence(backends);
     // The suite opens the engine at the v2 defaults (engine.rs:
@@ -878,9 +943,11 @@ fn result_json(backends: &[BackendResult], sz: Size) -> String {
     // default values, not hardcoded ones.
     let cfg = Config::new(PathBuf::new());
     let env_vars = format!(
-        "{{ {}: {}, {}: {} }}",
+        "{{ {}: {}, {}: {}, {}: {} }}",
         json_str(NIGHTLY_ENV),
         json_str(&std::env::var(NIGHTLY_ENV).unwrap_or_else(|_| "unset".into())),
+        json_str(BACKEND_ENV),
+        json_str(filter.unwrap_or("unset")),
         json_str(LOADER_ENV),
         json_str(&std::env::var(LOADER_ENV).unwrap_or_else(|_| "unset".into())),
     );
@@ -974,13 +1041,17 @@ fn result_json(backends: &[BackendResult], sz: Size) -> String {
 #[test]
 fn v2_m7_workloads() {
     let sz = size();
+    let filter = backend_filter();
     let mut results = Vec::new();
     let kinds: Vec<BackendKind> = vec![
         BackendKind::Memory,
         BackendKind::Redb,
         BackendKind::Aikoql,
         BackendKind::AikoqlV2,
-    ];
+    ]
+    .into_iter()
+    .filter(|k| filter.as_deref().is_none_or(|f| f == k.name()))
+    .collect();
     let mut paths = Vec::new();
     for kind in kinds {
         let path = tmp(&format!("v2-m7-{}", kind.name()));
@@ -1008,10 +1079,21 @@ fn v2_m7_workloads() {
         let dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../artifacts/storage-engine-v2");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("workloads.md"), benchmark_report(&results, sz)).unwrap();
+        // Scale/filter suffixes (SE2-M28): a 1m or single-backend run never
+        // clobbers the canonical 100K workloads.md/result.json.
+        let suffix = artifact_suffix(filter.as_deref());
+        std::fs::write(
+            dir.join(format!("workloads{suffix}.md")),
+            benchmark_report(&results, sz, filter.as_deref()),
+        )
+        .unwrap();
         // SE-11 (PR#2 review): machine-readable twin of workloads.md for
         // automated comparison (Markdown = human report, JSON = diffable).
-        std::fs::write(dir.join("result.json"), result_json(&results, sz)).unwrap();
+        std::fs::write(
+            dir.join(format!("result{suffix}.json")),
+            result_json(&results, sz, filter.as_deref()),
+        )
+        .unwrap();
     }
 }
 
