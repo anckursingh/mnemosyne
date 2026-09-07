@@ -12,10 +12,17 @@
 //! Usage: hand the scorer to `TransformerBoundaryDetector::new` (or
 //! `HybridBoundaryDetector::with_scorer`) — the seams PR-I established.
 //!
-//! ```ignore
-//! let config = TransformConfig::from_env().expect("AIKOQL_TRANSFORM_ENDPOINT");
+//! ```rust
+//! use aikoql_ingestion::transform::{TransformConfig, TransformScorer};
+//! use aikoql_ingestion::TransformerBoundaryDetector;
+//!
+//! let config = TransformConfig {
+//!     endpoint: "http://localhost:8080".into(),
+//!     api_key: None,
+//!     model: "transform-v1".into(),
+//! };
 //! let scorer = TransformScorer::new(config);
-//! let detector = TransformerBoundaryDetector::new(&scorer);
+//! let _detector = TransformerBoundaryDetector::new(&scorer);
 //! ```
 
 use crate::boundary::{BoundaryScore, BoundaryScorer};
