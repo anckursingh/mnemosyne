@@ -3,7 +3,16 @@ name: Release
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:  # npm-only rescue: publishes npm-publish/package.json's version via npm trusted publishing (all tag jobs skipped)
+  # Button path (option A): the dispatch run materializes the tag itself and
+  # then continues into the normal pipeline (a GITHUB_TOKEN tag push does not
+  # re-trigger workflows). Re-dispatch with an existing tag skips the tag step
+  # and degenerates into the old npm-only rescue.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.1.20). Empty = use the Cargo.toml version.'
+        required: false
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,13 +27,22 @@ jobs:
   # ── Version gate: git tag is the single source of truth ─────────
   validate-versions:
     name: Validate versions vs tag
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.gate.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - name: Check Cargo / npm / plugin versions match tag
+        id: gate
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = 'push' ]; then
+            tag="${GITHUB_REF_NAME#v}"
+          elif [ -n "${{ github.event.inputs.version }}" ]; then
+            tag="${{ github.event.inputs.version }}"
+          else
+            tag="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          fi
           cargo_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           npm_ver="$(sed -n 's/.*"version": "\(.*\)".*/\1/p' npm-publish/package.json | head -1)"
           plugin_ver="$(sed -n 's/.*"version": "\(.*\)".*/\1/p' .claude-plugin/plugin.json | head -1)"
@@ -34,12 +52,42 @@ jobs:
           [ "$tag" = "$plugin_ver" ] || { echo "::error::plugin version '$plugin_ver' != tag '$tag'"; fail=1; }
           grep -q "releases/download/v$tag/" website/index.html || { echo "::error::website/index.html not pinned to v$tag"; fail=1; }
           grep -q "releases/download/v$tag/" website/docs/getting-started.md || { echo "::error::getting-started.md not pinned to v$tag"; fail=1; }
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
           exit $fail
+
+  # ── Button path: materialize the tag, then the normal jobs run ──
+  # Runs only on workflow_dispatch; the tag push below cannot re-trigger this
+  # workflow (GITHUB_TOKEN rule), so the dispatch run itself continues through
+  # the build → release → npm pipeline. A re-dispatch with the tag already
+  # present skips gracefully — that degrades into the npm-only rescue.
+  create-tag:
+    name: Create release tag
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && needs.validate-versions.result == 'success' }}
+    needs: validate-versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Push tag v${{ needs.validate-versions.outputs.version }}
+        env:
+          TAG: v${{ needs.validate-versions.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::notice::tag $TAG already exists — skipping (rescue re-dispatch)"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "::notice::pushed tag $TAG"
 
   # ── Windows binary ──────────────────────────────────────────────
   windows:
     name: Build Windows (x86_64)
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: validate-versions
     runs-on: windows-latest
     steps:
@@ -65,7 +113,7 @@ jobs:
   # ── Linux glibc binary ──────────────────────────────────────────
   linux-gnu:
     name: Build Linux (x86_64-gnu)
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: validate-versions
     runs-on: ubuntu-latest
     steps:
@@ -92,7 +140,7 @@ jobs:
   # the tree and the cross image builds it as-is.
   linux-musl:
     name: Build Linux (x86_64-musl)
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: validate-versions
     runs-on: ubuntu-latest
     steps:
@@ -121,7 +169,7 @@ jobs:
   # x86_64-apple-darwin on the arm64 runner via cross-compilation.
   macos-intel:
     name: Build macOS (x86_64)
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: validate-versions
     runs-on: macos-latest
     steps:
@@ -145,7 +193,7 @@ jobs:
   # ── macOS Apple Silicon binary ──────────────────────────────────
   macos-arm:
     name: Build macOS (aarch64)
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: validate-versions
     runs-on: macos-latest
     steps:
@@ -174,7 +222,7 @@ jobs:
   # version/source/revision so `docker inspect` identifies the exact commit.
   docker-amd64:
     name: Docker image (linux/amd64)
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: validate-versions
     runs-on: ubuntu-latest
     permissions:
@@ -185,7 +233,7 @@ jobs:
       - name: Compute tags + labels
         id: tag
         run: |
-          v="${GITHUB_REF_NAME#v}"
+          v="${{ needs.validate-versions.outputs.version }}"
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
@@ -228,7 +276,7 @@ jobs:
 
   docker-arm64:
     name: Docker image (linux/arm64)
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: validate-versions
     runs-on: ubuntu-24.04-arm
     permissions:
@@ -239,7 +287,7 @@ jobs:
       - name: Compute tags + labels
         id: tag
         run: |
-          v="${GITHUB_REF_NAME#v}"
+          v="${{ needs.validate-versions.outputs.version }}"
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
@@ -269,8 +317,8 @@ jobs:
   # ── Docker manifest: merge arch images into canonical tags, print digest ──
   docker-manifest:
     name: Publish multi-arch image
-    if: github.event_name == 'push'
-    needs: [docker-amd64, docker-arm64]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [validate-versions, docker-amd64, docker-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -283,7 +331,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Merge manifests, tag, print digest
         run: |
-          v="${GITHUB_REF_NAME#v}"
+          v="${{ needs.validate-versions.outputs.version }}"
           minor="$(echo "$v" | sed 's/\.[0-9]*$//')"
           docker buildx imagetools create \
             -t ghcr.io/anckursingh/aikoql:${v} \
@@ -297,7 +345,7 @@ jobs:
   # ── GitHub Release ──────────────────────────────────────────────
   github-release:
     name: Publish Release
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: [validate-versions, windows, linux-gnu, linux-musl, macos-intel, macos-arm, docker-manifest]
     runs-on: ubuntu-latest
     permissions:
@@ -325,6 +373,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: v${{ needs.validate-versions.outputs.version }}
           files: |
             aikoql-mcp.exe
             aikoql-mcp.exe.sha256
