@@ -22,7 +22,7 @@ aikoql is organized as a layered operating system for knowledge:
 │  MVCC · OCC · HLC · RBAC · Audit · CDC        │
 ├──────────────────────────────────────────────┤
 │           STORAGE KERNEL                      │
-│  redb · EncryptedStore                        │
+│  aikoql-v2 LSM (default) · redb · EncryptedStore│
 └──────────────────────────────────────────────┘
 ```
 
@@ -74,10 +74,27 @@ The kernel now treats knowledge as a versioned, evidence-backed, evolving object
 
 ### Storage
 
-- **redb** — Embedded ACID-compliant key-value store. Single file per database.
-- **RocksDB** — LSM-tree engine for write-heavy workloads.
-- **MemoryEngine** — In-memory engine for testing and ephemeral workloads.
-- **EncryptedStore** — Wraps any StorageEngine with AES-256-GCM encryption.
+One `StorageEngine` trait, three engines, ratified default **aikoql-v2**
+(2026-09-07 ADR, `docs/STORAGE-ENGINE-ARCHITECTURE-DECISION.md`):
+
+- **aikoql-v2 (default)** — Segmented LSM tree written in Rust: group-commit
+  WAL → memtable → immutable segments (bloom filters, block index, v4 dense
+  entry cadence) → size-tiered compaction with relocation. On top of the LSM
+  sits an **identity/placement layer**: every object has a LogicalId separate
+  from where a copy physically lives (ReplicaId → placement directory) — the
+  foundation for sharding and replication without a format rewrite. Bounded
+  memory (LRU block cache) and bounded recovery (directory checkpoints: at
+  600K updates, open = 75 ms / 1.7 MB vs 348 ms / 41 MB full replay).
+- **redb** — Copy-on-write B-tree, single file. Compatibility fallback:
+  snapshots and pre-v2 databases keep opening as redb.
+- **aikoql v1** — WAL + RAM mirror. Read-hot profile for RAM-affordant
+  deployments with bounded datasets.
+- **EncryptedStore** — Wraps any engine with AES-256-GCM.
+
+The default auto-detects the format at the path: a fresh path creates
+aikoql-v2, an existing redb file opens as redb, a v1 WAL opens as v1 — an
+upgrade never reinterprets an existing database. The certified cross-engine
+matrix (W1–W8, resources, gate status) lives in [Benchmarks](/docs/benchmarks).
 
 ### Event System (CDC)
 
@@ -223,6 +240,11 @@ Remember → Property Types → Uniqueness → Cardinality → Domain → Check 
 ```
 crates/
 ├── kernel/           Knowledge Kernel (MVCC, OCC, HLC, RBAC, audit)
+├── storage/          Storage engines behind one StorageEngine trait
+│   ├── aikoql-v2/    Segmented LSM (default): WAL + memtable + tiered
+│   │                 compaction, identity/replica/placement directories,
+│   │                 checkpoint-bounded recovery
+│   └── aikoql/       v1 WAL + RAM mirror (read-hot profile)
 ├── compiler/         aikoql parser, semantic analyzer, planner
 ├── runtime/          Physical plan interpreter
 ├── constraints/      Constraint engine (C1-C9, ~95% complete)
@@ -253,4 +275,4 @@ crates/
 **Zero external runtime dependencies.** The binary is a single self-contained file:
 - Windows: 3.4 MB (PE32+ x86-64)
 - Linux: 3.7 MB (ELF64 static musl, no glibc)
-- Embedded database (redb), no external DB server required
+- Embedded database (aikoql-v2 segmented LSM by default; redb and aikoql v1 as profile engines) — no external DB server required

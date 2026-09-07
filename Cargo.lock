@@ -225,6 +225,7 @@ dependencies = [
  "aikoql-kernel",
  "aikoql-runtime",
  "aikoql-storage",
+ "aikoql-storage-v2",
  "pyo3",
 ]
 

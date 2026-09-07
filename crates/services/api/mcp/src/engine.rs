@@ -27,13 +27,15 @@ use std::sync::Arc;
 /// failed closed at the config layer). `None` (the default) auto-detects
 /// the existing format at `db_path`: a v2 database directory (CURRENT
 /// present) opens as aikoql-v2, a file with the v1 WAL magic ("AKQL")
-/// opens as aikoql, anything else — a missing path included — is redb, the
-/// stable default (redb validates its own format and fails closed on
-/// anything else). Detection makes upgrades safe in both directions: a
-/// redb database from before the backend switch and a native WAL written
-/// while aikoql was the production default both keep working at the same
-/// path. A directory that is not a v2 database is an explicit error —
-/// never a silent fresh create.
+/// opens as aikoql, any other existing FILE falls through to redb (redb
+/// validates its own format and fails closed on anything else — snapshots
+/// and pre-flip databases keep working), and a MISSING path is a fresh
+/// aikoql-v2 create — the ratified production default (2026-09-07 ADR,
+/// docs/STORAGE-ENGINE-ARCHITECTURE-DECISION.md). Detection makes upgrades
+/// safe in both directions: a redb database from before the backend switch
+/// and a native WAL written while aikoql was the production default both
+/// keep working at the same path. A directory that is not a v2 database is
+/// an explicit error — never a silent fresh create.
 fn open_engine(db_path: &str, backend: Option<StorageBackend>) -> KResult<Arc<dyn StorageEngine>> {
     let backend = match backend {
         Some(b) => b,
@@ -46,9 +48,10 @@ fn open_engine(db_path: &str, backend: Option<StorageBackend>) -> KResult<Arc<dy
     }
 }
 
-/// Sniff the on-disk format. A <4-byte file falls through to redb, whose
-/// own header validation fails closed — the native WAL parser never
-/// truncates or reinterprets a non-AKQL file.
+/// Sniff the on-disk format. A <4-byte or non-AKQL file falls through to
+/// redb, whose own header validation fails closed — the native WAL parser
+/// never truncates or reinterprets a non-AKQL file. A missing path is a
+/// fresh aikoql-v2 create (the 2026-09-07 default flip).
 fn detect_backend(db_path: &str) -> KResult<StorageBackend> {
     let p = std::path::Path::new(db_path);
     if p.is_dir() {
@@ -68,7 +71,7 @@ fn detect_backend(db_path: &str) -> KResult<StorageBackend> {
             }
             Ok(StorageBackend::Redb)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StorageBackend::Redb),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StorageBackend::AikoqlV2),
         Err(e) => Err(KError::Store(format!("read {db_path}: {e}"))),
     }
 }
@@ -245,6 +248,26 @@ mod tests {
         assert!(
             format!("{err}").contains("not an aikoql-v2 database"),
             "got: {err}"
+        );
+    }
+
+    /// 2026-09-07 default flip (ADR STORAGE-ENGINE-ARCHITECTURE-DECISION):
+    /// a FRESH path (missing) auto-creates aikoql-v2 — the ratified
+    /// production default. An existing non-AKQL FILE still falls through to
+    /// redb (snapshots and pre-flip databases keep working — the SE-01
+    /// regression above pins that direction byte-exact).
+    #[test]
+    fn fresh_path_auto_creates_aikoql_v2() {
+        let path = scratch("fresh-default");
+        let engine = open_engine(&path, None).unwrap();
+        let mut b = WriteBatch::new();
+        b.put(b"k".to_vec(), b"v".to_vec());
+        engine.write_batch(&b).unwrap();
+        assert_eq!(engine.get(b"k").unwrap(), Some(b"v".to_vec()));
+        drop(engine);
+        assert!(
+            std::path::Path::new(&path).join("CURRENT").is_file(),
+            "a fresh path must create a v2 database directory with CURRENT"
         );
     }
 }

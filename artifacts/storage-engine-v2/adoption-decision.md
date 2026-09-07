@@ -107,3 +107,13 @@ v2 seeding is now ≈ v1's (221.6 s vs 230.2 s, −3.7%), RSS is 30% below v1's,
 **Gate 5 re-bound: ≤2× → ≤8× v1 (user decision, after the M22 evidence).** The ≤2× bar was RAM-vs-RAM — v1's mirror pays zero disk by design — and this document's own remediation section (09-01) already records that no bounded-RAM path reaches it ("the ≤2×-of-RAM-mirror bar is unreachable at scale without giving the trade back"). M22 shipped the miss-path levers (no-copy first-touch checksum8, one bloom hash pair per get shared across segment probes) and re-probed: W1 P50 39.5 → 33.5 µs, of which block io 18.7 µs (62% of the engine get_wall) is the bounded-RAM floor — positional read + soft sha256 ~10 µs/16 KiB (fast backends surveyed and rejected on MSVC: 0.10 `compress` is a stub, `asm` ships GAS `.S` sources MSVC cannot assemble, 0.11 `x86-sha` crashes non-SHA CPUs). Expected ratio 5.6–6.7×, inside ≤8× with 1.2–1.5× headroom; a real regression (≈13×+) still fails the gate. Enforced at `GATE5_SLOWDOWN_BOUND` in `kse_m7_v2_workloads.rs`.
 
 The NOT ADOPT verdict above stands as the record through M19. The re-bound makes gate 5 a bounded-RAM design gate rather than an adoption gate: if the next certified matrix passes all gates under the amended bound, the adoption question re-opens for a user decision — the re-bound does not by itself flip the verdict.
+
+## Ratification — 2026-09-07: ADOPT as the production default
+
+The condition recorded above fired, and the user made the decision:
+
+- **SE2-M39** (09-06) ran the certified matrix again — gate 5 **6.00× / 5.48× v1** (W1/W2), inside the amended ≤8× bound with 1.2–1.5× headroom, and the full acceptance matrix passed (oracle 20K ops + 3 crash windows zero divergence).
+- **SE2-M40** (09-07) closed the hardening review's last open P0 (directory checkpoint: 600K-update open 75.0 ms / 1.73 MB vs 347.6 ms / 41.1 MB full replay).
+- **2026-09-07, user ratification: ADOPT** — aikoql-v2 is the production default. Shipped: `engine.rs` auto-detection now creates a missing path as `aikoql-v2` (existing redb files and v1 WALs still auto-detect to their engines), and the Python SDK defaults `backend = "aikoql-v2"`. The decision and its evidence live in the ADR `docs/STORAGE-ENGINE-ARCHITECTURE-DECISION.md` (status: accepted).
+
+The 09-01 NOT ADOPT verdict stands as history, not as the current record: it was superseded by this ratification, exactly as the 09-05 amendment said it could be.

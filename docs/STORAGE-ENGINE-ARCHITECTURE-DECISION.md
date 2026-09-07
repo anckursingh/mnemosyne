@@ -1,6 +1,6 @@
 # ADR — AikoQL Storage V2 as the Forward Storage Engine
 
-- **Status:** proposed (decision-maker: the user; per `adoption-decision.md` the adoption question re-opens only on a user decision)
+- **Status:** accepted — ratified by the user 2026-09-07 (record: `artifacts/storage-engine-v2/adoption-decision.md` §Ratification; the default flip is shipped: `engine.rs` missing-path auto-create → v2, Python SDK `backend = "aikoql-v2"`)
 - **Date:** 2026-09-07 · **Branch:** `feature/sorage-engine`
 - **Candidates:** `aikoql-v2` (segmented LSM), `aikoql` v1 (WAL + RAM mirror), `redb` (COW B-tree), `rocksdb` (C++ LSM, reference point)
 - **Evidence basis:** the certified cross-engine matrix `artifacts/storage-engine-v2/workloads.md` (2026-09-06, release, 100K KOs / 20K ops), `adoption-decision.md` (09-01/09-04/09-05), `directory-checkpoint.md` (09-07), M7 v1-adoption matrix, KSE-142/143 recovery-memory suites. All numbers below are measured in this repo; nothing is estimated.
@@ -175,7 +175,7 @@ This is the M28 spec's §28.1 requirement realized: `LogicalId(42) != ReplicaId(
 
 **ADOPT AikoQL Storage V2 as the forward storage engine.**
 
-1. **v2 becomes the strategic target and the default** once the user ratifies this ADR (the `adoption-decision.md` amendment already recorded that the certified matrix passing all gates under the amended bound re-opens the question — M39's matrix did exactly that, and M40 closed the review's last open P0).
+1. **v2 is the strategic target and the default** — ratified 2026-09-07 and shipped: a fresh (missing) `db_path` auto-creates `aikoql-v2` (`engine.rs`), the Python SDK defaults to `backend = "aikoql-v2"`, and `STORAGE-BACKENDS.md` now records v2 as the production default. (The `adoption-decision.md` amendment recorded that a certified matrix passing all gates under the amended bound re-opens the question — M39's matrix did exactly that, and M40 closed the review's last open P0.)
 2. **v1 remains available** as the read-hot/RAM-affordant profile via the existing `storage.backend = aikoql` knob — auto-detection at the path makes any direction of the switch safe (`STORAGE-BACKENDS.md`). No migration is required to keep it.
 3. **redb stays the opt-out compatibility backend**, not a target.
 4. **rocksdb is not adopted** — the reference LSM; v2 is the application-specialized Rust realization of the same architecture.
@@ -196,4 +196,4 @@ The decision rests on the axes the application lives on — write-mixed throughp
 
 - The warm-read gap stays ~6× v1 until levers 2–4 land; deployments that are pure read-hot and RAM-affordant should stay on `aikoql` until then. This is stated, not hidden: the amended gate is a design gate, and the 09-01 NOT ADOPT record stands until this ADR is ratified.
 - RocksDB has no measured row here; the comparison against it is architectural. A rocksdb backend harness would be the honest way to convert that row from reasoning to evidence if it is ever wanted.
-- `STORAGE-BACKENDS.md` still describes v2 as experimental; ratifying this ADR changes that doc's profile table and default line — a one-line edit, left pending the decision.
+- `STORAGE-BACKENDS.md` has been updated with this ratification: v2 is the production default, redb is the opt-out compatibility fallback, and the auto-detection table records the missing-path rule.

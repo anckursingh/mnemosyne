@@ -18,8 +18,10 @@ pip install aikoql
 ```python
 import aikoql_py
 
-# Open a database
-kernel = aikoql_py.Kernel.open("./kb.redb")
+# Open a database — the default backend is aikoql-v2: a fresh path creates
+# a database directory. Existing .redb files still open as redb, and a v1
+# WAL still opens as v1 (auto-detection, never reinterpretation).
+kernel = aikoql_py.Kernel.open("./kb")
 
 # Create an object
 result = kernel.remember({
@@ -39,6 +41,17 @@ for r in results:
 
 # aikoql
 result = kernel.aikoql("MATCH Employee RETURN name, role")
+```
+
+The unified `Agent` interface auto-detects its target the same way — any
+filesystem path is embedded mode (fresh paths included), `"host:port"` is
+server mode:
+
+```python
+from aikoql import Agent
+
+db = Agent.connect("./kb")          # embedded, aikoql-v2 by default
+db = Agent.connect("localhost:9090")  # MCP server over TCP
 ```
 
 ## LangGraph + CrewAI

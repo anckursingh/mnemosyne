@@ -1407,12 +1407,13 @@ fn mvp_rec_002_backup_destroy_restore_round_trip() {
         "backup must appear in list_backups, got {names:?}"
     );
 
-    // Phase 3: destroy — kill the server, delete the database file (give
+    // Phase 3: destroy — kill the server, delete the database (a redb file
+    // pre-flip, an aikoql-v2 directory now — the 2026-09-07 default; give
     // the killed process a moment to release the handle on Windows).
     drop(c);
     let mut removed = false;
     for _ in 0..20 {
-        if std::fs::remove_file(&db).is_ok() {
+        if std::fs::remove_file(&db).is_ok() || std::fs::remove_dir_all(&db).is_ok() {
             removed = true;
             break;
         }
