@@ -53,6 +53,9 @@ header nav a:hover { color: var(--text); text-decoration: none; }
 .stat { text-align: center; }
 .stat .n { font-size: 32px; font-weight: 800; color: var(--accent); }
 .stat .l { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+.stats-src { flex-basis: 100%; text-align: center; font-size: 13px; color: var(--muted); margin-top: -20px; }
+.stats-src a { color: var(--accent); text-decoration: none; }
+.stats-src a:hover { text-decoration: underline; }
 
 section { max-width: var(--max-w); margin: 0 auto; padding: 60px 24px; }
 section h2 { font-size: 28px; font-weight: 700; margin-bottom: 12px; letter-spacing: -0.5px; }
@@ -136,12 +139,13 @@ footer .links { margin-bottom: 12px; display: flex; gap: 20px; justify-content: 
 </section>
 
 <div class="stats">
-  <div class="stat"><div class="n">370K+</div><div class="l">Reads/sec</div></div>
-  <div class="stat"><div class="n">120K+</div><div class="l">Writes/sec</div></div>
-  <div class="stat"><div class="n">88</div><div class="l">MCP Tools</div></div>
+  <div class="stat"><div class="n">6.0×</div><div class="l">Write-mixed throughput vs redb</div></div>
+  <div class="stat"><div class="n">33×</div><div class="l">Better p99 tail (978 µs)</div></div>
+  <div class="stat"><div class="n">428 MiB</div><div class="l">Peak RSS @ 100K objects</div></div>
+  <div class="stat"><div class="n">65%</div><div class="l">Less disk than redb</div></div>
   <div class="stat"><div class="n">4</div><div class="l">Language SDKs</div></div>
-  <div class="stat"><div class="n">4</div><div class="l">DB Connectors</div></div>
   <div class="stat"><div class="n">0</div><div class="l">Runtime Deps</div></div>
+  <div class="stats-src">From the certified matrix — <a href="/docs/benchmarks">all W1–W8 numbers, methodology, and the honest deficit</a></div>
 </div>
 
 <div class="divider"></div>
@@ -361,6 +365,7 @@ aikoql&gt; MATCH Employee EPISTEMIC verified RETURN *    # only verified knowled
       <button class="tab" onclick="showInstall('windows',this)">Windows</button>
       <button class="tab" onclick="showInstall('linux',this)">Linux (musl)</button>
       <button class="tab" onclick="showInstall('macos',this)">macOS</button>
+      <button class="tab" onclick="showInstall('docker',this)">Docker</button>
       <button class="tab" onclick="showInstall('source',this)">From Source</button>
     </div>
     <div id="inst-npm"><pre><code>npm install -g aikoql-mcp
@@ -376,6 +381,12 @@ chmod +x aikoql-mcp-macos-arm64 && mv aikoql-mcp-macos-arm64 /usr/local/bin/aiko
 # Intel
 curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.19/aikoql-mcp-macos
 chmod +x aikoql-mcp-macos && mv aikoql-mcp-macos /usr/local/bin/aikoql</code></pre></div>
+    <div id="inst-docker" style="display:none"><pre><code>docker pull ghcr.io/anckursingh/aikoql:0.1.19
+docker run -d --name aikoql \
+  -e AIKOQL_TCP_TOKEN=changeme:acme:admin \
+  -v aikoql_data:/data \
+  ghcr.io/anckursingh/aikoql:0.1.19
+docker exec aikoql aikoql --version</code></pre></div>
     <div id="inst-source" style="display:none"><pre><code>git clone https://github.com/anckursingh/aikoql.git
 cd aikoql
 cargo build --release -p aikoql-mcp

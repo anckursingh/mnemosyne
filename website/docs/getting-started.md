@@ -88,6 +88,37 @@ curl -LO https://github.com/anckursingh/aikoql/releases/download/v0.1.19/aikoql-
 chmod +x aikoql-mcp-macos && mv aikoql-mcp-macos /usr/local/bin/aikoql
 ```
 
+### Docker (multi-arch: amd64 + arm64)
+
+```bash
+docker pull ghcr.io/anckursingh/aikoql:0.1.19
+
+docker run -d --name aikoql \
+  -e AIKOQL_TCP_TOKEN=changeme:acme:admin \
+  -v aikoql_data:/data \
+  ghcr.io/anckursingh/aikoql:0.1.19
+```
+
+`AIKOQL_TCP_TOKEN` is required — TCP auth is fail-closed
+(`TOKEN[:TENANT[:ROLES]]`). Everything mutable lives under the `/data` volume
+(db at `/data/aikoql.redb`, models in `/data/models`). Tags: `0.1.19` (pin
+this), `0.1`, `latest`.
+
+The server binds loopback-only inside the container (plaintext bearer tokens
+never leave the host), so published ports don't reach it — probe and use it
+from inside:
+
+```bash
+docker exec aikoql curl -fsS http://127.0.0.1:9091/health
+docker exec aikoql aikoql --version
+docker exec aikoql aikoql model install   # optional: offline embeddings
+```
+
+For MCP over TCP from another process, share the container's network
+namespace (`docker run --rm --network container:aikoql ...`); for MCP stdio
+from the host, use the npm binary instead. A compose file
+(`docker-compose.release.yml`) exists for production deploys.
+
 ### Verify
 
 ```bash
