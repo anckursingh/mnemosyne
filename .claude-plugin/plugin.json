@@ -21,10 +21,18 @@
     "encryption",
     "rust"
   ],
+  "userConfig": {
+    "KB_PATH": {
+      "type": "directory",
+      "title": "Knowledge base directory",
+      "description": "Where aikoql stores your knowledge base. A fresh path auto-creates an aikoql-v2 database directory; existing redb files, v1 WALs and snapshots still auto-detect.",
+      "default": "./aikoql-kb"
+    }
+  },
   "mcpServers": {
     "aikoql": {
       "command": "npx",
-      "args": ["-y", "aikoql-mcp@0.1.19", "serve", "--metrics-addr", "127.0.0.1:9091"]
+      "args": ["-y", "aikoql-mcp@0.1.19", "serve", "${user_config.KB_PATH}", "--metrics-addr", "127.0.0.1:9091"]
     }
   }
 }
