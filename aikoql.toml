@@ -4,9 +4,11 @@
 # Docker image ships it there). Override with --config PATH.
 
 [storage]
-# Storage backend: only "redb" is built (the rocksdb backend feature does not
-# exist — see MVP-001). Unknown values are rejected at startup.
-backend = "redb"
+# Storage backend: the default is "aikoql-v2" — a fresh path auto-creates its
+# directory, while existing redb files, v1 WALs and snapshots still
+# auto-detect. Name one explicitly to force a backend; unknown values are
+# rejected at startup.
+# backend = "redb"
 # Path to the redb database file.
 path = "./aikoql.redb"
 
