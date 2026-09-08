@@ -2186,11 +2186,25 @@ fn lock_directory(dir: &Path) -> Result<File, FormatError> {
         .write(true)
         .open(&path)
         .map_err(|e| FormatError::Io(format!("open LOCK {}: {e}", path.display())))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(_) => Err(FormatError::Locked(format!(
-            "database directory is held by another process: {}",
-            dir.display()
-        ))),
+    // CI observed a Locked on a reopen microseconds after the previous
+    // holder's drop (Linux, one run in three) — a hold-over the code
+    // cannot produce. Retry a bounded window on WouldBlock; a live second
+    // writer still fails closed (§19), and the OS reason rides the error
+    // so a recurrence names its real cause.
+    let mut attempt = 0;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if attempt < 10 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                return Err(FormatError::Locked(format!(
+                    "database directory is held by another process: {} ({e:?})",
+                    dir.display()
+                )));
+            }
+        }
     }
 }
